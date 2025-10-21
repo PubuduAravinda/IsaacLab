@@ -15,11 +15,9 @@ from isaaclab.utils import configclass
 from isaaclab_assets.robots.unitree import UNITREE_GO1_CFG
 from isaaclab.terrains.config.rough import ROUGH_TERRAINS_CFG
 
-
 @configclass
 class EventCfg:
     """Events configuration for domain randomization"""
-
     physics_material = EventTerm(
         func=mdp.randomize_rigid_body_material,
         mode="startup",
@@ -42,57 +40,50 @@ class EventCfg:
         },
     )
 
-
 @configclass
 class Go1SceneCfg(InteractiveSceneCfg):
     """Scene configuration with Go1 robot and sensors"""
-
-    # Ground plane
     ground = AssetBaseCfg(
         prim_path="/World/ground",
         spawn=sim_utils.GroundPlaneCfg(size=(50.0, 50.0)),
     )
 
-    # In your Go1SceneCfg
     light = AssetBaseCfg(
         prim_path="/World/Light",
         spawn=sim_utils.DistantLightCfg(
-            intensity=3000.0,  # Increased for better carpet illumination
+            intensity=2000.0,
             color=(1.0, 1.0, 1.0),
-            angle=1.5  # Wider coverage
+            angle=1.5
         )
     )
 
-    # Add additional focused light on the ground
     ground_light = AssetBaseCfg(
         prim_path="/World/GroundLight",
         spawn=sim_utils.DistantLightCfg(
-            intensity=1500.0,
-            color=(1.0, 0.95, 0.9),  # Warm light for better carpet colors
-            angle=0.3  # Focused on ground
+            intensity=800.0,
+            color=(1.0, 0.95, 0.9),
+            angle=0.3
         )
     )
 
     carpet_light = AssetBaseCfg(
         prim_path="/World/CarpetLight",
         spawn=sim_utils.DistantLightCfg(
-            intensity=800.0,
-            color=(1.0, 0.95, 0.9),  # Slightly warm light
+            intensity=500.0,
+            color=(1.0, 0.95, 0.9),
             angle=0.8
         )
     )
 
-    # Add additional fill light
     fill_light = AssetBaseCfg(
         prim_path="/World/FillLight",
         spawn=sim_utils.DistantLightCfg(
-            intensity=500.0,
+            intensity=300.0,
             color=(0.9, 0.9, 1.0),
             angle=0.5
         )
     )
 
-    # Robot configuration
     robot: ArticulationCfg = UNITREE_GO1_CFG.replace(
         prim_path="/World/envs/env_.*/Robot",
         spawn=UNITREE_GO1_CFG.spawn.replace(
@@ -100,7 +91,6 @@ class Go1SceneCfg(InteractiveSceneCfg):
         )
     )
 
-    # Contact sensor
     contact_sensor = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/.*",
         update_period=0.0,
@@ -115,35 +105,31 @@ class Go1SceneCfg(InteractiveSceneCfg):
         data_types=["rgb"],
         update_latest_camera_pose=True,
         spawn=sim_utils.PinholeCameraCfg(
-            focal_length=4.0,  # Wider angle for closer view
-            focus_distance=0.3,  # Focus on closer ground
-            horizontal_aperture=40.0,  # Wider view
-            clipping_range=(0.05, 2.0),
-            f_stop=1.8,  # More light for closer view
+            focal_length=4.0,
+            focus_distance=0.2,
+            horizontal_aperture=40.0,
+            clipping_range=(0.01, 10.0),
+            f_stop=8.0,  # Larger for sharper images
         ),
         offset=CameraCfg.OffsetCfg(
-            pos=(0.0, 0.0, -0.18),  # LOWER: 18cm below trunk instead of 10cm
-            rot=(0.0, 0.0, 0.0, 1.0),  # Keep straight down
+            pos=(0.0, 0.0, -0.20),
+            rot=(0.0, -0.7071, 0.0, 0.7071),  # -90° around y-axis
             convention="ros"
         ),
     )
 
-
 @configclass
 class Go1FlatEnvCfg(DirectRLEnvCfg):
     """Configuration for Go1 on flat terrain with carpet-like ground"""
-
-    # Environment settings
     episode_length_s = 20.0
     decimation = 4
     action_scale = 1.0
     action_space = 12
-    observation_space = 47 + 320 * 320 * 3  # 47 state + flattened RGB (HxWx3)
+    observation_space = 47  # State-only observation
     state_space = 0
     num_envs = 5
     env_spacing = 3.0
 
-    # Simulation settings
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 200,
         render_interval=decimation,
@@ -156,7 +142,6 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
         ),
     )
 
-    # Flat terrain configuration with visual material
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="plane",
@@ -168,31 +153,25 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
             dynamic_friction=1.0,
             restitution=0.0,
         ),
-        # Use a predefined material
         visual_material=sim_utils.PreviewSurfaceCfg(
-            diffuse_color=(0.3, 0.1, 0.6),  # Purple
+            diffuse_color=(0.3, 0.1, 0.6),
             roughness=0.9,
             metallic=0.0,
         ),
         debug_vis=False,
     )
 
-    # Scene with robot and sensors
     scene: Go1SceneCfg = Go1SceneCfg(
         num_envs=num_envs,
         env_spacing=env_spacing,
         replicate_physics=False
     )
 
-    # Domain randomization events
     events: EventCfg = EventCfg()
-
 
 @configclass
 class Go1RoughEnvCfg(Go1FlatEnvCfg):
     """Configuration for Go1 on rough terrain"""
-
-    # Override terrain for rough terrain
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="generator",
@@ -202,7 +181,7 @@ class Go1RoughEnvCfg(Go1FlatEnvCfg):
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
             restitution_combine_mode="multiply",
-            static_friction=1.2,  # Increased for carpet-like friction
+            static_friction=1.2,
             dynamic_friction=1.0,
         ),
         debug_vis=False,
