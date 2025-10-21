@@ -50,13 +50,46 @@ class Go1SceneCfg(InteractiveSceneCfg):
     # Ground plane
     ground = AssetBaseCfg(
         prim_path="/World/ground",
-        spawn=sim_utils.GroundPlaneCfg(size=(100.0, 100.0))
+        spawn=sim_utils.GroundPlaneCfg(size=(50.0, 50.0)),
     )
 
-    # Lights
+    # In your Go1SceneCfg
     light = AssetBaseCfg(
         prim_path="/World/Light",
-        spawn=sim_utils.DistantLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75))
+        spawn=sim_utils.DistantLightCfg(
+            intensity=3000.0,  # Increased for better carpet illumination
+            color=(1.0, 1.0, 1.0),
+            angle=1.5  # Wider coverage
+        )
+    )
+
+    # Add additional focused light on the ground
+    ground_light = AssetBaseCfg(
+        prim_path="/World/GroundLight",
+        spawn=sim_utils.DistantLightCfg(
+            intensity=1500.0,
+            color=(1.0, 0.95, 0.9),  # Warm light for better carpet colors
+            angle=0.3  # Focused on ground
+        )
+    )
+
+    carpet_light = AssetBaseCfg(
+        prim_path="/World/CarpetLight",
+        spawn=sim_utils.DistantLightCfg(
+            intensity=800.0,
+            color=(1.0, 0.95, 0.9),  # Slightly warm light
+            angle=0.8
+        )
+    )
+
+    # Add additional fill light
+    fill_light = AssetBaseCfg(
+        prim_path="/World/FillLight",
+        spawn=sim_utils.DistantLightCfg(
+            intensity=500.0,
+            color=(0.9, 0.9, 1.0),
+            angle=0.5
+        )
     )
 
     # Robot configuration
@@ -75,35 +108,37 @@ class Go1SceneCfg(InteractiveSceneCfg):
     )
 
     camera = CameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/trunk/front_cam",  # Child of the robot's trunk
+        prim_path="{ENV_REGEX_NS}/Robot/trunk/front_cam",
         update_period=0.0,
-        height=64,
-        width=64,
+        height=320,
+        width=320,
         data_types=["rgb"],
-        update_latest_camera_pose=False,  # Disable to avoid potential issues with XFormPrimView on child prims
+        update_latest_camera_pose=True,
         spawn=sim_utils.PinholeCameraCfg(
-            focal_length=24.0,
-            focus_distance=400.0,
-            horizontal_aperture=20.955,
-            clipping_range=(0.01, 10.0),
+            focal_length=4.0,  # Wider angle for closer view
+            focus_distance=0.3,  # Focus on closer ground
+            horizontal_aperture=40.0,  # Wider view
+            clipping_range=(0.05, 2.0),
+            f_stop=1.8,  # More light for closer view
         ),
         offset=CameraCfg.OffsetCfg(
-            pos=(0.25, 0.0, 0.12),  # Position relative to the 'trunk' link
-            rot=(0.5, -0.5, 0.5, -0.5),  # ROS convention
+            pos=(0.0, 0.0, -0.18),  # LOWER: 18cm below trunk instead of 10cm
+            rot=(0.0, 0.0, 0.0, 1.0),  # Keep straight down
             convention="ros"
         ),
     )
 
+
 @configclass
 class Go1FlatEnvCfg(DirectRLEnvCfg):
-    """Configuration for Go1 on flat terrain"""
+    """Configuration for Go1 on flat terrain with carpet-like ground"""
 
     # Environment settings
     episode_length_s = 20.0
     decimation = 4
     action_scale = 1.0
     action_space = 12
-    observation_space = 47 + 64 * 64 * 3  # 47 state + flattened RGB
+    observation_space = 47 + 320 * 320 * 3  # 47 state + flattened RGB (HxWx3)
     state_space = 0
     num_envs = 5
     env_spacing = 3.0
@@ -115,13 +150,13 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
             restitution_combine_mode="multiply",
-            static_friction=1.0,
+            static_friction=1.2,
             dynamic_friction=1.0,
             restitution=0.0,
         ),
     )
 
-    # Flat terrain configuration
+    # Flat terrain configuration with visual material
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="plane",
@@ -129,9 +164,15 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
             restitution_combine_mode="multiply",
-            static_friction=1.0,
+            static_friction=1.2,
             dynamic_friction=1.0,
             restitution=0.0,
+        ),
+        # Use a predefined material
+        visual_material=sim_utils.PreviewSurfaceCfg(
+            diffuse_color=(0.3, 0.1, 0.6),  # Purple
+            roughness=0.9,
+            metallic=0.0,
         ),
         debug_vis=False,
     )
@@ -161,7 +202,7 @@ class Go1RoughEnvCfg(Go1FlatEnvCfg):
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
             restitution_combine_mode="multiply",
-            static_friction=1.0,
+            static_friction=1.2,  # Increased for carpet-like friction
             dynamic_friction=1.0,
         ),
         debug_vis=False,
