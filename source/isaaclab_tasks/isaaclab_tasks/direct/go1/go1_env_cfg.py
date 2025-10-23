@@ -60,7 +60,7 @@ class Go1SceneCfg(InteractiveSceneCfg):
     ground_light = AssetBaseCfg(
         prim_path="/World/GroundLight",
         spawn=sim_utils.DistantLightCfg(
-            intensity=800.0,
+            intensity=1500.0,
             color=(1.0, 0.95, 0.9),
             angle=0.3
         )
@@ -69,7 +69,7 @@ class Go1SceneCfg(InteractiveSceneCfg):
     carpet_light = AssetBaseCfg(
         prim_path="/World/CarpetLight",
         spawn=sim_utils.DistantLightCfg(
-            intensity=500.0,
+            intensity=1000.0,
             color=(1.0, 0.95, 0.9),
             angle=0.8
         )
@@ -78,7 +78,7 @@ class Go1SceneCfg(InteractiveSceneCfg):
     fill_light = AssetBaseCfg(
         prim_path="/World/FillLight",
         spawn=sim_utils.DistantLightCfg(
-            intensity=300.0,
+            intensity=600.0,
             color=(0.9, 0.9, 1.0),
             angle=0.5
         )
@@ -97,23 +97,23 @@ class Go1SceneCfg(InteractiveSceneCfg):
         debug_vis=False,
     )
 
+    # Camera attached to trunk body as a child prim
     camera = CameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/trunk/front_cam",
+        prim_path="{ENV_REGEX_NS}/Robot/trunk/belly_cam",
         update_period=0.0,
         height=320,
         width=320,
         data_types=["rgb"],
-        update_latest_camera_pose=True,
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=4.0,
             focus_distance=0.2,
-            horizontal_aperture=40.0,
+            horizontal_aperture=20.0,
             clipping_range=(0.01, 10.0),
-            f_stop=8.0,  # Larger for sharper images
+            f_stop=8.0,
         ),
         offset=CameraCfg.OffsetCfg(
-            pos=(0.0, 0.0, -0.20),
-            rot=(0.0, -0.7071, 0.0, 0.7071),  # -90° around y-axis
+            pos=(0.0, 0.0, -0.01),  # 1cm below trunk center
+            rot=(0.0, 1.0, 0.0, 0.0),  # 180° around X = point down in ROS
             convention="ros"
         ),
     )
@@ -123,11 +123,11 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
     """Configuration for Go1 on flat terrain with carpet-like ground"""
     episode_length_s = 20.0
     decimation = 4
-    action_scale = 1.0
+    action_scale = 0.5
     action_space = 12
-    observation_space = 47  # State-only observation
+    observation_space = 47
     state_space = 0
-    num_envs = 5
+    num_envs = 1
     env_spacing = 3.0
 
     sim: SimulationCfg = SimulationCfg(
@@ -167,7 +167,7 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
         replicate_physics=False
     )
 
-    events: EventCfg = EventCfg()
+    events: EventCfg = None
 
 @configclass
 class Go1RoughEnvCfg(Go1FlatEnvCfg):
