@@ -51,7 +51,7 @@ class Go1SceneCfg(InteractiveSceneCfg):
     light = AssetBaseCfg(
         prim_path="/World/Light",
         spawn=sim_utils.DistantLightCfg(
-            intensity=2000.0,
+            intensity=5000.0,  # Increased for better visibility
             color=(1.0, 1.0, 1.0),
             angle=1.5
         )
@@ -60,7 +60,7 @@ class Go1SceneCfg(InteractiveSceneCfg):
     ground_light = AssetBaseCfg(
         prim_path="/World/GroundLight",
         spawn=sim_utils.DistantLightCfg(
-            intensity=1500.0,
+            intensity=3000.0,  # Increased
             color=(1.0, 0.95, 0.9),
             angle=0.3
         )
@@ -69,7 +69,7 @@ class Go1SceneCfg(InteractiveSceneCfg):
     carpet_light = AssetBaseCfg(
         prim_path="/World/CarpetLight",
         spawn=sim_utils.DistantLightCfg(
-            intensity=1000.0,
+            intensity=2000.0,  # Increased
             color=(1.0, 0.95, 0.9),
             angle=0.8
         )
@@ -78,7 +78,7 @@ class Go1SceneCfg(InteractiveSceneCfg):
     fill_light = AssetBaseCfg(
         prim_path="/World/FillLight",
         spawn=sim_utils.DistantLightCfg(
-            intensity=600.0,
+            intensity=1200.0,  # Increased
             color=(0.9, 0.9, 1.0),
             angle=0.5
         )
@@ -87,33 +87,33 @@ class Go1SceneCfg(InteractiveSceneCfg):
     robot: ArticulationCfg = UNITREE_GO1_CFG.replace(
         prim_path="/World/envs/env_.*/Robot",
         spawn=UNITREE_GO1_CFG.spawn.replace(
+            usd_path="/home/sripu715/Downloads/go1_belly_cam.usd",
+            copy_from_source=True,
             activate_contact_sensors=True,
         )
     )
 
     contact_sensor = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/.*",
+        prim_path="{ENV_REGEX_NS}/Robot/go1/.*_foot",  # Target only foot bodies
         update_period=0.0,
         debug_vis=False,
     )
 
-    # Camera attached to trunk body as a child prim
     camera = CameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/trunk/belly_cam",
+        prim_path="{ENV_REGEX_NS}/Robot/go1/trunk/belly_cam_sim",
         update_period=0.0,
         height=320,
         width=320,
         data_types=["rgb"],
         spawn=sim_utils.PinholeCameraCfg(
-            focal_length=4.0,
+            focal_length=18.14756,
             focus_distance=0.2,
-            horizontal_aperture=20.0,
+            horizontal_aperture=20.955,
             clipping_range=(0.01, 10.0),
-            f_stop=8.0,
         ),
         offset=CameraCfg.OffsetCfg(
-            pos=(0.0, 0.0, -0.01),  # 1cm below trunk center
-            rot=(0.0, 1.0, 0.0, 0.0),  # 180° around X = point down in ROS
+            pos=(-0.0092, 0.0, -0.0839),
+            rot=(0.0, 0.7071, -0.7071, 0.0),
             convention="ros"
         ),
     )
