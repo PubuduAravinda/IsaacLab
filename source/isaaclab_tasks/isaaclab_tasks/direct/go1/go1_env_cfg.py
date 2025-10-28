@@ -51,7 +51,7 @@ class Go1SceneCfg(InteractiveSceneCfg):
     light = AssetBaseCfg(
         prim_path="/World/Light",
         spawn=sim_utils.DistantLightCfg(
-            intensity=5000.0,  # Increased for better visibility
+            intensity=400.0,
             color=(1.0, 1.0, 1.0),
             angle=1.5
         )
@@ -60,7 +60,7 @@ class Go1SceneCfg(InteractiveSceneCfg):
     ground_light = AssetBaseCfg(
         prim_path="/World/GroundLight",
         spawn=sim_utils.DistantLightCfg(
-            intensity=3000.0,  # Increased
+            intensity=100.0,
             color=(1.0, 0.95, 0.9),
             angle=0.3
         )
@@ -69,7 +69,7 @@ class Go1SceneCfg(InteractiveSceneCfg):
     carpet_light = AssetBaseCfg(
         prim_path="/World/CarpetLight",
         spawn=sim_utils.DistantLightCfg(
-            intensity=2000.0,  # Increased
+            intensity=50.0,
             color=(1.0, 0.95, 0.9),
             angle=0.8
         )
@@ -78,7 +78,7 @@ class Go1SceneCfg(InteractiveSceneCfg):
     fill_light = AssetBaseCfg(
         prim_path="/World/FillLight",
         spawn=sim_utils.DistantLightCfg(
-            intensity=1200.0,  # Increased
+            intensity=100.0,
             color=(0.9, 0.9, 1.0),
             angle=0.5
         )
@@ -87,33 +87,33 @@ class Go1SceneCfg(InteractiveSceneCfg):
     robot: ArticulationCfg = UNITREE_GO1_CFG.replace(
         prim_path="/World/envs/env_.*/Robot",
         spawn=UNITREE_GO1_CFG.spawn.replace(
-            usd_path="/home/sripu715/Downloads/go1_belly_cam.usd",
-            copy_from_source=True,
             activate_contact_sensors=True,
         )
     )
 
     contact_sensor = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/go1/.*_foot",  # Target only foot bodies
+        prim_path="{ENV_REGEX_NS}/Robot/.*",
         update_period=0.0,
         debug_vis=False,
     )
 
     camera = CameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/go1/trunk/belly_cam_sim",
+        prim_path="{ENV_REGEX_NS}/Robot/trunk/front_cam",
         update_period=0.0,
         height=320,
         width=320,
         data_types=["rgb"],
+        update_latest_camera_pose=True,
         spawn=sim_utils.PinholeCameraCfg(
-            focal_length=18.14756,
-            focus_distance=0.2,
-            horizontal_aperture=20.955,
+            focal_length=5,  # Wider for more periphery (legs/shadows)
+            focus_distance=0.15,  # Adjusted for closer ground view
+            horizontal_aperture=20.0,  # Wider FOV
             clipping_range=(0.01, 10.0),
+            f_stop=16.0,  # Higher for sharper images
         ),
         offset=CameraCfg.OffsetCfg(
-            pos=(-0.0092, 0.0, -0.0839),
-            rot=(0.0, 0.7071, -0.7071, 0.0),
+            pos=(0.0, 0.0, -0.01),
+            rot=(0.0, -0.7071, 0.0, 0.7071),  # -90° around y-axis
             convention="ros"
         ),
     )
@@ -123,11 +123,11 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
     """Configuration for Go1 on flat terrain with carpet-like ground"""
     episode_length_s = 20.0
     decimation = 4
-    action_scale = 0.5
+    action_scale = 1.0
     action_space = 12
-    observation_space = 47
+    observation_space = 47  # State-only observation
     state_space = 0
-    num_envs = 1
+    num_envs = 5
     env_spacing = 3.0
 
     sim: SimulationCfg = SimulationCfg(
@@ -167,7 +167,7 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
         replicate_physics=False
     )
 
-    events: EventCfg = None
+    events: EventCfg = EventCfg()
 
 @configclass
 class Go1RoughEnvCfg(Go1FlatEnvCfg):
