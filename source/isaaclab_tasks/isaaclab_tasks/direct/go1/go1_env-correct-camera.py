@@ -12,7 +12,6 @@ import os
 from .go1_env_cfg import Go1FlatEnvCfg, Go1RoughEnvCfg
 import numpy as np
 from scipy.spatial.transform import Rotation as R  # Added for adjustable rotation
-import cv2
 
 class Go1Env(DirectRLEnv):
     cfg: Go1FlatEnvCfg | Go1RoughEnvCfg
@@ -62,20 +61,6 @@ class Go1Env(DirectRLEnv):
         print(f"   Pitch: {pitch_angle_deg}° (your working value)")
         print(f"   Roll: {roll_angle_deg}° (your working value)")
         print(f"   Expected: Clear carpet + legs/shadows visible")
-
-        print("[INFO] Loading MiDaS-small model...")
-        self.midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small", pretrained=True)
-        self.midas.to(self.device)
-        self.midas.eval()
-
-        self.midas_transform = torch.hub.load("intel-isl/MiDaS", "transforms").small_transform
-
-        self.region_size = 40
-        self.region_points = {
-            "tl": (0.1, 0.1), "tr": (0.9, 0.1),
-            "bl": (0.1, 0.9), "br": (0.9, 0.9),
-            "center": (0.5, 0.5)
-        }
 
     def _debug_camera_transforms(self):
         try:
@@ -139,6 +124,18 @@ class Go1Env(DirectRLEnv):
             print(f"   Forward Vector: [{forward_world[0]:.3f}, {forward_world[1]:.3f}, {forward_world[2]:.3f}]")
             print(f"   Angle from down: {angle_down:.1f}°")
             print(f"   Applied Local Rot: [{self._cam_local_rot[env_idx][0]:.3f}, {self._cam_local_rot[env_idx][1]:.3f}, {self._cam_local_rot[env_idx][2]:.3f}, {self._cam_local_rot[env_idx][3]:.3f}]")
+
+            if angle_down < 5:
+                print("   ✅ PERFECT: Camera pointing straight down!")
+            elif angle_down < 15:
+                print("   ✅ GOOD: Camera nearly vertical down")
+            else:
+                print("   ❌ ISSUE: Camera not pointing down correctly")
+
+            if camera_pos[2] < 0.15:
+                print("   ✅ Camera is low enough to see ground")
+            else:
+                print("   ⚠️ Camera might be too high to see ground clearly")
 
         except Exception as e:
             print(f"📷 Camera direction debug error: {e}")
@@ -235,190 +232,162 @@ class Go1Env(DirectRLEnv):
 
         # State-only observation (47D)
         state = torch.cat([
-            gravity, angular_vel, foot_contacts,
-            joint_pos, joint_vel, height, self._actions
+            gravity,  # 3
+            angular_vel,  # 3
+            foot_contacts,  # 4
+            joint_pos,  # 12
+            joint_vel,  # 12
+            height,  # 1
+            self._actions  # 12
         ], dim=-1)
-        assert state.shape[1] == 47
+        assert state.shape[1] == 47, f"State shape mismatch: expected 47, got {state.shape[1]}"
+        print(f"Debug: observation shape = {state.shape}")
 
-        # -------------------------------
-        # Manual camera pose update
-        # -------------------------------
-        trunk_pos = self._robot.data.body_pos_w[:, self._trunk_idx]
+        # Manual camera pose update using trunk
+        trunk_pos = self._robot.data.body_pos_w[:, self._trunk_idx]  # Shape: (num_envs, 1, 3) or similar
         trunk_quat = self._robot.data.body_quat_w[:, self._trunk_idx]
-        if trunk_pos.dim() == 3: trunk_pos = trunk_pos.squeeze(1)
-        if trunk_quat.dim() == 3: trunk_quat = trunk_quat.squeeze(1)
+
+        if trunk_pos.dim() == 3:
+            trunk_pos = trunk_pos.squeeze(1)
+        if trunk_quat.dim() == 3:
+            trunk_quat = trunk_quat.squeeze(1)
 
         cam_pos = trunk_pos + quat_apply(trunk_quat, self._cam_local_pos)
         cam_quat = quat_mul(trunk_quat, self._cam_local_rot)
 
+        # Update camera pose with sync for reliability
         self._camera.set_world_poses(cam_pos, cam_quat, convention="ros")
         self._camera._update_poses(list(range(self.num_envs)))
         self._camera.update(dt=self.physics_dt)
 
-        # -------------------------------
-        # RGB Preprocessing (match offline: uint8 RGB input to transform)
-        # -------------------------------
-        rgb = self._camera.data.output["rgb"].float() / 255.0  # (N, H, W, 3), float [0,1]
-        rgb_enhanced = torch.clamp(rgb * 1.3, 0.0, 1.0)
+        # Camera and RGB processing for visualization only (not included in obs)
+        rgb = self._camera.data.output["rgb"].float() / 255.0
 
-        # Sharpen
-        kernel = torch.tensor([[[[0, -0.2, 0], [-0.2, 2.0, -0.2], [0, -0.2, 0]]]], device=self.device)
-        kernel = kernel.repeat(3, 1, 1, 1)
-        rgb_permuted = rgb_enhanced.permute(0, 3, 1, 2)
-        rgb_sharpened = torch.nn.functional.conv2d(rgb_permuted, kernel, padding=1, groups=3)
-        rgb_sharpened = rgb_sharpened.permute(0, 2, 3, 1)
-        rgb_input = torch.clamp(rgb_sharpened, 0.0, 1.0)
-
-        # Flip vertically (belly cam upside-down)
-        rgb_flipped = torch.flip(rgb_input, dims=[1])
-
-        # Rotate 180° → upright image (ground at bottom)
-        rgb_upright = torch.rot90(rgb_flipped, k=2, dims=[1, 2])
-
-        # -------------------------------
-        # MiDaS Inference (match offline: uint8 numpy input)
-        # -------------------------------
-        with torch.no_grad():
-            depth_maps = []
-            for env_idx in range(self.num_envs):
-                # Convert to uint8 numpy, like cv2.imread → cvtColor
-                img_rgb = (rgb_upright[env_idx].cpu().numpy() * 255).astype(np.uint8)  # uint8 RGB
-
-                # Transform like offline
-                input_tensor = self.midas_transform(img_rgb)  # (1, 3, 256, 256)
-
-                # Forward
-                prediction = self.midas(input_tensor.to(self.device))
-
-                # Upsample
-                prediction = torch.nn.functional.interpolate(
-                    prediction.unsqueeze(1),
-                    size=(rgb_input.shape[1], rgb_input.shape[2]),
-                    mode="bicubic",
-                    align_corners=False,
-                ).squeeze()
-
-                depth_maps.append(prediction.cpu().numpy())
-
-        depth_maps = np.stack(depth_maps)  # (N, H, W)
-
-        # -------------------------------
-        # Regional Depth Extraction
-        # -------------------------------
-        h, w = rgb_input.shape[1], rgb_input.shape[2]
-        region_depths_all = []
-        for i in range(self.num_envs):
-            depth = depth_maps[i]
-            vals = {}
-            for name, (px, py) in self.region_points.items():
-                cx, cy = int(w * px), int(h * py)
-                x1 = max(0, cx - self.region_size)
-                x2 = min(w, cx + self.region_size)
-                y1 = max(0, cy - self.region_size)
-                y2 = min(h, cy + self.region_size)
-                vals[name] = float(np.mean(depth[y1:y2, x1:x2]))
-            region_depths_all.append(vals)
-
-        # -------------------------------
-        # Save RGB + Depth + MiDaS Input
-        # -------------------------------
+        # Save and debug every 5 steps for faster iteration
         if self._global_step % 5 == 0:
-            os.makedirs("camera_images", exist_ok=True)
-            os.makedirs("midas_input_debug", exist_ok=True)
+            roll_pitch = torch.sqrt(gravity[:, 0] ** 2 + gravity[:, 1] ** 2)
+            print(f"Robot roll_pitch: {roll_pitch[0].item():.3f}")
+            rgb_enhanced = torch.clamp(rgb * 1.3, 0.0, 1.0)
+            kernel = torch.tensor([[[[0, -0.2, 0], [-0.2, 2.0, -0.2], [0, -0.2, 0]]]], device=self.device)
+            kernel = kernel.repeat(3, 1, 1, 1)
+            rgb_permuted = rgb.permute(0, 3, 1, 2)
+            rgb_sharpened = torch.nn.functional.conv2d(rgb_permuted, kernel, padding=1, groups=3)
+            rgb_sharpened = rgb_sharpened.permute(0, 2, 3, 1)
+            rgb_enhanced = torch.clamp(rgb_sharpened, 0.0, 1.0)
+            save_rgb = rgb_enhanced
 
-            # Save RGB (first 3 envs)
-            for env_idx in range(min(3, self.num_envs)):
-                img_tensor = rgb_upright[env_idx].permute(2, 0, 1)
-                save_image(img_tensor, f"camera_images/env_{env_idx}_step_{self._global_step:06d}.png")
+            # Flip the image vertically to correct orientation
+            save_rgb = torch.flip(save_rgb, dims=[1])  # Flip along height dimension
 
-                # Save exact MiDaS input (for offline validation)
-                img_np = (rgb_upright[env_idx].cpu().numpy() * 255).astype(np.uint8)
-                img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-                cv2.imwrite(f"midas_input_debug/env_{env_idx}_step_{self._global_step:06d}.png", img_bgr)
-
-            # Save Depth (all envs)
-            for env_idx in range(self.num_envs):
-                depth = depth_maps[env_idx]
-                depth_norm = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-                depth_color = cv2.applyColorMap(depth_norm, cv2.COLORMAP_PLASMA)
-                cv2.imwrite(f"camera_images/env_{env_idx}_step_{self._global_step:06d}_depth.png", depth_color)
-
-            print(f"Saved RGB, Depth, and MiDaS input at step {self._global_step}")
-
-        # -------------------------------
-        # Unified Debug Output
-        # -------------------------------
-        if self._global_step % 5 == 0:
-            robot_pos = self._robot.data.root_pos_w
-            cam_pos_actual = self._camera.data.pos_w
-            cam_pos_expected = cam_pos
-            errors = torch.norm(cam_pos_actual - cam_pos_expected, dim=-1)
-
-            print(f"\nStep {self._global_step} - Camera + Depth Tracking (ALL {self.num_envs} envs):")
-            for i in range(self.num_envs):
-                r = robot_pos[i]
-                c = cam_pos_actual[i]
-                e = cam_pos_expected[i]
-                err = errors[i].item()
-                d = region_depths_all[i]
-                print(
-                    f"  env {i:02d} | "
-                    f"Robot: [{r[0]:6.3f}, {r[1]:6.3f}, {r[2]:6.3f}] | "
-                    f"Camera: [{c[0]:6.3f}, {c[1]:6.3f}, {c[2]:6.3f}] | "
-                    f"Expected: [{e[0]:6.3f}, {e[1]:6.3f}, {e[2]:6.3f}] | "
-                    f"Error: {err:6.3f}m | "
-                    f"Depth(tl/tr/bl/br/c): {d['tl']:.2f}/{d['tr']:.2f}/{d['bl']:.2f}/{d['br']:.2f}/{d['center']:.2f}"
-                )
-
-            # Keep original debug functions
             self._debug_camera_tracking()
             self._debug_camera_direction()
             self._debug_camera_transforms()
+            self._debug_what_camera_sees()  # Added for leg/shadow check
+            os.makedirs("camera_images", exist_ok=True)
+            for env_idx in range(min(3, self.num_envs)):
+                img_tensor = save_rgb[env_idx].permute(2, 0, 1)
+                save_image(img_tensor, f"camera_images/env_{env_idx}_step_{self._global_step:06d}.png")
+                # h, w = img_tensor.shape[1], img_tensor.shape[2]
+                # crop_h, crop_w = h // 2, w // 2
+                # start_h, start_w = (h - crop_h) // 2, (w - crop_w) // 2
+                # cropped = img_tensor[:, start_h:start_h + crop_h, start_w:start_w + crop_w]
+                # save_image(cropped, f"camera_images/env_{env_idx}_step_{self._global_step:06d}_cropped.png")
+            print(f"💾 Saved enhanced belly camera images at step {self._global_step}")
+
+        if self._global_step % 5 == 0:
+            test_quat = self._cam_local_rot[0]
+            print(f"🔧 APPLIED CAMERA ROTATION: [{test_quat[0]:.4f}, {test_quat[1]:.4f}, {test_quat[2]:.4f}, {test_quat[3]:.4f}]")
 
         return {"policy": state}
 
     def _debug_camera_tracking(self):
-        """
-        Debug camera tracking for *all* environments in a single, compact line.
-        Example output:
-            🤖 Robot: [ 2.97, -1.50, 0.263]   📷 Camera (actual): [ 3.01, -1.51, 0.248]   🎯 Expected: [ 3.01, -1.51, 0.248]   Tracking Error: 0.000m
-        """
         try:
-            robot_pos = self._robot.data.root_pos_w          # (num_envs, 3)
-            robot_quat = self._robot.data.root_quat_w        # (num_envs, 4)
-            cam_pos = self._camera.data.pos_w                # (num_envs, 3)
-            # Local offset & rotation (already broadcast to all envs)
-            local_pos = self._cam_local_pos                  # (num_envs, 3)
-            local_rot = self._cam_local_rot                  # (num_envs, 4)
-            cam_pos_expected = robot_pos + quat_apply(robot_quat, local_pos)
-            cam_quat_expected = quat_mul(robot_quat, local_rot)   # not printed but kept for sanity
-            errors = torch.norm(cam_pos - cam_pos_expected, dim=-1)   # (num_envs,)
-            print(f"\nStep {self._global_step} - Camera Tracking (ALL {self.num_envs} envs):")
-            for i in range(self.num_envs):
-                r = robot_pos[i]
-                c = cam_pos[i]
-                e = cam_pos_expected[i]
-                err = errors[i].item()
+            if (hasattr(self._robot, 'data') and hasattr(self._camera, 'data') and
+                    self._robot.data.root_pos_w is not None and self._camera.data.pos_w is not None):
+                env_idx = 0
+                robot_pos = self._robot.data.root_pos_w[env_idx]
+                camera_pos = self._camera.data.pos_w[env_idx]
+                robot_rot = self._robot.data.root_quat_w[env_idx]
+                cam_offset_local = self._cam_local_pos[env_idx]
+                cam_offset_world = quat_apply(robot_rot.unsqueeze(0).float(), cam_offset_local.unsqueeze(0).float()).squeeze(0)  # Ensure float32
+                expected_pos = robot_pos + cam_offset_world
+                current_error = torch.norm(camera_pos - expected_pos).item()
+                distance = torch.norm(robot_pos - camera_pos).item()
 
-                line = (
-                    f"  env {i:02d} | "
-                    f"Robot: [{r[0]:6.3f}, {r[1]:6.3f}, {r[2]:6.3f}] | "
-                    f"Camera (actual): [{c[0]:6.3f}, {c[1]:6.3f}, {c[2]:6.3f}] | "
-                    f"Expected: [{e[0]:6.3f}, {e[1]:6.3f}, {e[2]:6.3f}] | "
-                    f"Tracking Error: {err:6.3f}m"
-                )
-                print(line)
-            if errors[0] < 0.01:
-                print("   EXCELLENT: Auto tracking working perfectly!")
-            elif errors[0] < 0.05:
-                print("   GOOD: Auto tracking with minimal error")
-            elif errors[0] < 0.1:
-                print("   ACCEPTABLE: Auto tracking with some error")
-            else:
-                print("   POOR: Auto tracking not working")
+                print(f"\n📊 Step {self._global_step} - Camera Tracking (AUTO):")
+                print(f"   Update latest camera pose: {self._camera.cfg.update_latest_camera_pose}")
+                print(f"   Camera frame count: {self._camera._frame}")
+                print(f"   PRIM PATHS:")
+                print(f"   🤖 Robot:  {self._robot.cfg.prim_path}")
+                print(f"   📷 Camera: {self._camera.cfg.prim_path}")
+                print(f"   CAMERA OFFSET (local): [{cam_offset_local[0]:.2f}, {cam_offset_local[1]:.2f}, {cam_offset_local[2]:.2f}]")
+                print(f"   POSITIONS:")
+                print(f"   🤖 Robot:    [{robot_pos[0]:6.2f}, {robot_pos[1]:6.2f}, {robot_pos[2]:6.3f}]")
+                print(f"   📷 Camera (actual):   [{camera_pos[0]:6.2f}, {camera_pos[1]:6.2f}, {camera_pos[2]:6.3f}]")
+                print(f"   🎯 Expected: [{expected_pos[0]:6.2f}, {expected_pos[1]:.2f}, {expected_pos[2]:6.3f}]")
+                print(f"   METRICS:")
+                print(f"   📏 Robot-Camera Distance: {distance:6.3f}m")
+                print(f"   ❌ Tracking Error:        {current_error:6.3f}m")
+
+                if current_error < 0.01:
+                    print("   ✅ EXCELLENT: Auto tracking working perfectly!")
+                elif current_error < 0.05:
+                    print("   ✅ GOOD: Auto tracking with minimal error")
+                elif current_error < 0.1:
+                    print("   ⚠️ ACCEPTABLE: Auto tracking with some error")
+                else:
+                    print("   ❌ POOR: Auto tracking not working")
+                    print("   🔧 TROUBLESHOOTING: Check camera parent-child relationship in USD")
 
         except Exception as e:
-            print(f"Debug error: {e}")
+            print(f"📷 Debug error: {e}")
+
+    def _debug_what_camera_sees(self):
+        """Analyze camera image content (added for leg/shadow check)"""
+        try:
+            env_idx = 0
+            rgb = self._camera.data.output["rgb"].float() / 255.0
+            image = rgb[env_idx]
+
+            height, width, _ = image.shape
+            center_h, center_w = height // 2, width // 2
+            region_size = min(height, width) // 6
+
+            # Sample different regions
+            center = image[center_h - region_size:center_h + region_size,
+            center_w - region_size:center_w + region_size, :]
+            top = image[0:region_size * 2, center_w - region_size:center_w + region_size, :]
+            bottom = image[height - region_size * 2:height, center_w - region_size:center_w + region_size, :]
+            left = image[center_h - region_size:center_h + region_size, 0:region_size * 2, :]
+            right = image[center_h - region_size:center_h + region_size, width - region_size * 2:width, :]
+
+            center_brightness = torch.mean(image).item()
+
+            print("\n🔍 Belly Cam Image Analysis:")
+            print(f"   Overall brightness: {center_brightness:.3f}")
+            print(f"   Center: {torch.mean(center).item():.3f} (should be ground/carpet)")
+            print(f"   Top: {torch.mean(top).item():.3f} (robot FORWARD direction)")
+            print(f"   Bottom: {torch.mean(bottom).item():.3f} (robot BACK direction)")
+            print(f"   Left: {torch.mean(left).item():.3f} (robot LEFT side)")
+            print(f"   Right: {torch.mean(right).item():.3f} (robot RIGHT side)")
+
+            # Check if legs are visible (dark spots on sides)
+            if torch.mean(left).item() < center_brightness - 0.1 or torch.mean(right).item() < center_brightness - 0.1:
+                print(f"   ✅ Robot legs visible (dark regions on sides)")
+            else:
+                print(f"   ⚠️ No legs detected - try tilting pitch or moving forward")
+
+            if center_brightness > 0.3:
+                print(f"   ✅ Good exposure - ground clearly visible")
+            elif center_brightness > 0.15:
+                print(f"   ⚠️ Acceptable - ground visible but could be brighter")
+                print(f"   💡 Try: Lower camera more or increase lighting")
+            else:
+                print(f"   ❌ Too dark - robot body blocking view")
+                print(f"   💡 Try: Much lower camera or move forward")
+
+        except Exception as e:
+            print(f"❌ Image analysis error: {e}")
 
     def _get_foot_contact_binary(self) -> torch.Tensor:
         try:
