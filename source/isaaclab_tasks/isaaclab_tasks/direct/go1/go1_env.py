@@ -40,6 +40,8 @@ class Go1Env(DirectRLEnv):
 
         self._trunk_idx = self._robot.find_bodies("trunk")[0]
 
+        self._camera_offset = 0.10
+
         # ADJUST THESE VALUES TO TEST DIFFERENT CAMERA POSITIONS/ANGLES:
         # Start with old-style higher pos + slight forward for legs/shadows
         cam_pos_offset = [0.05, 0.0, -0.01]  # Forward 5cm, below 1cm (old height for peripheral view)
@@ -225,24 +227,66 @@ class Go1Env(DirectRLEnv):
         self._robot.set_joint_position_target(self._processed_actions)
         self.scene.write_data_to_sim()
 
+    def _get_vision_height(self, depth_maps: np.ndarray) -> torch.Tensor:
+        h, w = depth_maps.shape[1], depth_maps.shape[2]
+
+        # ——— AUTO-CALIBRATE ONCE (first 20 steps) ———
+        if not hasattr(self, "MIDAS_TO_M"):
+            # First time only
+            if not hasattr(self, "calib_vals"):
+                self.calib_vals = []
+                self.calib_step = 0
+                print("AUTO-CALIB STARTED (20 steps)")
+
+            if self.calib_step < 20:
+                # Sample pure ground from env 0
+                y1 = int(h * 0.88)
+                x1, x2 = int(w * 0.38), int(w * 0.62)
+                val = np.mean(depth_maps[0, y1:, x1:x2])
+                self.calib_vals.append(val)
+                self.calib_step += 1
+                print(f"  [CALIB] step {self.calib_step}/20 → MiDaS {val:.1f}")
+                # FALLBACK: use temporary ratio
+                temp_ratio = 1570.0
+                ground_vals = [np.mean(depth_maps[i, y1:, x1:x2]) for i in range(self.num_envs)]
+                ground_depth = torch.tensor(ground_vals, device=self.device)
+                return torch.clamp(ground_depth / temp_ratio, 0.05, 1.0)
+
+            # CALIBRATION DONE
+            avg = np.mean(self.calib_vals)
+            self.MIDAS_TO_M = avg / 0.277
+            print(f"\nAUTO-CALIBRATED! MIDAS_TO_M = {self.MIDAS_TO_M:.1f}")
+            print(f"   Vision locked to 0.277 m when standing\n")
+
+        # ——— NORMAL MODE ———
+        y1 = int(h * 0.88)
+        x1, x2 = int(w * 0.38), int(w * 0.62)
+        ground_vals = [np.mean(depth_maps[i, y1:, x1:x2]) for i in range(self.num_envs)]
+        ground_depth = torch.tensor(ground_vals, device=self.device)
+        height_m = ground_depth / self.MIDAS_TO_M
+
+        return torch.clamp(height_m, 0.05, 1.0)
+
+
+    def _get_height_estimate(self, depth_maps: np.ndarray) -> torch.Tensor:
+        try:
+            return self._get_vision_height(depth_maps)
+        except Exception as e:
+            print(f"[VISION FALLBACK] {e}")
+            trunk_h = self._robot.data.root_pos_w[:, 2]
+            gravity = self._robot.data.projected_gravity_b
+            tilt = torch.sqrt(gravity[:, 0]**2 + gravity[:, 1]**2)
+            h = trunk_h * (1 - tilt * 0.2) - getattr(self, "_camera_offset", 0.10)
+            return torch.clamp(h, 0.05, 1.0)
+
     def _get_observations(self) -> dict:
         self._previous_actions = self._actions.clone()
         gravity, angular_vel = self._get_imu_data()
         foot_contacts = self._get_foot_contact_binary()
         joint_pos = self._robot.data.joint_pos - self._robot.data.default_joint_pos
         joint_vel = self._robot.data.joint_vel
-        height = self._robot.data.root_pos_w[:, 2:3]
 
-        # State-only observation (47D)
-        state = torch.cat([
-            gravity, angular_vel, foot_contacts,
-            joint_pos, joint_vel, height, self._actions
-        ], dim=-1)
-        assert state.shape[1] == 47
-
-        # -------------------------------
-        # Manual camera pose update
-        # -------------------------------
+        # --- Camera pose update ---
         trunk_pos = self._robot.data.body_pos_w[:, self._trunk_idx]
         trunk_quat = self._robot.data.body_quat_w[:, self._trunk_idx]
         if trunk_pos.dim() == 3: trunk_pos = trunk_pos.squeeze(1)
@@ -255,13 +299,10 @@ class Go1Env(DirectRLEnv):
         self._camera._update_poses(list(range(self.num_envs)))
         self._camera.update(dt=self.physics_dt)
 
-        # -------------------------------
-        # RGB Preprocessing (match offline: uint8 RGB input to transform)
-        # -------------------------------
-        rgb = self._camera.data.output["rgb"].float() / 255.0  # (N, H, W, 3), float [0,1]
+        # --- RGB Preprocessing (match your working version) ---
+        rgb = self._camera.data.output["rgb"].float() / 255.0
         rgb_enhanced = torch.clamp(rgb * 1.3, 0.0, 1.0)
 
-        # Sharpen
         kernel = torch.tensor([[[[0, -0.2, 0], [-0.2, 2.0, -0.2], [0, -0.2, 0]]]], device=self.device)
         kernel = kernel.repeat(3, 1, 1, 1)
         rgb_permuted = rgb_enhanced.permute(0, 3, 1, 2)
@@ -269,74 +310,50 @@ class Go1Env(DirectRLEnv):
         rgb_sharpened = rgb_sharpened.permute(0, 2, 3, 1)
         rgb_input = torch.clamp(rgb_sharpened, 0.0, 1.0)
 
-        # Flip vertically (belly cam upside-down)
         rgb_flipped = torch.flip(rgb_input, dims=[1])
-
-        # Rotate 180° → upright image (ground at bottom)
         rgb_upright = torch.rot90(rgb_flipped, k=2, dims=[1, 2])
 
-        # -------------------------------
-        # MiDaS Inference (match offline: uint8 numpy input)
-        # -------------------------------
+        # --- LIVE MiDaS ---
         with torch.no_grad():
-            depth_maps = []
-            for env_idx in range(self.num_envs):
-                # Convert to uint8 numpy, like cv2.imread → cvtColor
-                img_rgb = (rgb_upright[env_idx].cpu().numpy() * 255).astype(np.uint8)  # uint8 RGB
+            input_list = [self.midas_transform(img.cpu().numpy()) for img in rgb_upright]
+            batch = torch.cat(input_list, dim=0).to(self.device).squeeze(1)
 
-                # Transform like offline
-                input_tensor = self.midas_transform(img_rgb)  # (1, 3, 256, 256)
+            prediction = self.midas(batch)
+            if prediction.dim() == 3:
+                prediction = prediction.unsqueeze(1)
+            prediction = torch.nn.functional.interpolate(
+                prediction,
+                size=(rgb_input.shape[1], rgb_input.shape[2]),
+                mode="bicubic",
+                align_corners=False,
+            ).squeeze(1)
 
-                # Forward
-                prediction = self.midas(input_tensor.to(self.device))
+        depth_maps = prediction.cpu().numpy()  # (N, H, W)
+        self.last_depth_maps = depth_maps
 
-                # Upsample
-                prediction = torch.nn.functional.interpolate(
-                    prediction.unsqueeze(1),
-                    size=(rgb_input.shape[1], rgb_input.shape[2]),
-                    mode="bicubic",
-                    align_corners=False,
-                ).squeeze()
+        # --- Height from MiDaS (live calc) ---
+        height_estimate = self._get_height_estimate(depth_maps).unsqueeze(1)  # (N,1)
 
-                depth_maps.append(prediction.cpu().numpy())
+        # --- Full obs ---
+        obs = torch.cat([
+            gravity, angular_vel, foot_contacts,
+            joint_pos, joint_vel, height_estimate,
+            self._actions
+        ], dim=-1)
 
-        depth_maps = np.stack(depth_maps)  # (N, H, W)
-
-        # -------------------------------
-        # Regional Depth Extraction
-        # -------------------------------
-        h, w = rgb_input.shape[1], rgb_input.shape[2]
-        region_depths_all = []
-        for i in range(self.num_envs):
-            depth = depth_maps[i]
-            vals = {}
-            for name, (px, py) in self.region_points.items():
-                cx, cy = int(w * px), int(h * py)
-                x1 = max(0, cx - self.region_size)
-                x2 = min(w, cx + self.region_size)
-                y1 = max(0, cy - self.region_size)
-                y2 = min(h, cy + self.region_size)
-                vals[name] = float(np.mean(depth[y1:y2, x1:x2]))
-            region_depths_all.append(vals)
-
-        # -------------------------------
-        # Save RGB + Depth + MiDaS Input
-        # -------------------------------
+        # --- Save images/debug (your %5 logic) ---
         if self._global_step % 5 == 0:
             os.makedirs("camera_images", exist_ok=True)
             os.makedirs("midas_input_debug", exist_ok=True)
 
-            # Save RGB (first 3 envs)
             for env_idx in range(min(3, self.num_envs)):
-                img_tensor = rgb_upright[env_idx].permute(2, 0, 1)
-                save_image(img_tensor, f"camera_images/env_{env_idx}_step_{self._global_step:06d}.png")
+                save_image(rgb_upright[env_idx].permute(2, 0, 1),
+                           f"camera_images/env_{env_idx}_step_{self._global_step:06d}.png")
 
-                # Save exact MiDaS input (for offline validation)
                 img_np = (rgb_upright[env_idx].cpu().numpy() * 255).astype(np.uint8)
                 img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
                 cv2.imwrite(f"midas_input_debug/env_{env_idx}_step_{self._global_step:06d}.png", img_bgr)
 
-            # Save Depth (all envs)
             for env_idx in range(self.num_envs):
                 depth = depth_maps[env_idx]
                 depth_norm = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
@@ -345,9 +362,7 @@ class Go1Env(DirectRLEnv):
 
             print(f"Saved RGB, Depth, and MiDaS input at step {self._global_step}")
 
-        # -------------------------------
-        # Unified Debug Output
-        # -------------------------------
+        # --- Debug print ---
         if self._global_step % 5 == 0:
             robot_pos = self._robot.data.root_pos_w
             cam_pos_actual = self._camera.data.pos_w
@@ -360,22 +375,19 @@ class Go1Env(DirectRLEnv):
                 c = cam_pos_actual[i]
                 e = cam_pos_expected[i]
                 err = errors[i].item()
-                d = region_depths_all[i]
                 print(
                     f"  env {i:02d} | "
                     f"Robot: [{r[0]:6.3f}, {r[1]:6.3f}, {r[2]:6.3f}] | "
                     f"Camera: [{c[0]:6.3f}, {c[1]:6.3f}, {c[2]:6.3f}] | "
                     f"Expected: [{e[0]:6.3f}, {e[1]:6.3f}, {e[2]:6.3f}] | "
-                    f"Error: {err:6.3f}m | "
-                    f"Depth(tl/tr/bl/br/c): {d['tl']:.2f}/{d['tr']:.2f}/{d['bl']:.2f}/{d['br']:.2f}/{d['center']:.2f}"
+                    f"Error: {err:6.3f}m"
                 )
 
-            # Keep original debug functions
             self._debug_camera_tracking()
             self._debug_camera_direction()
             self._debug_camera_transforms()
 
-        return {"policy": state}
+        return {"policy": obs}
 
     def _debug_camera_tracking(self):
         """
@@ -421,35 +433,109 @@ class Go1Env(DirectRLEnv):
             print(f"Debug error: {e}")
 
     def _get_foot_contact_binary(self) -> torch.Tensor:
-        try:
-            if not hasattr(self._contact_sensor.data, 'net_forces_w'):
-                return torch.zeros(self.num_envs, 4, device=self.device)
-            contact_forces = torch.norm(self._contact_sensor.data.net_forces_w, dim=-1)
-            binary_contact = (contact_forces > 1.0).float()
-            if binary_contact.shape[1] >= 4:
-                return binary_contact[:, :4]
-            else:
-                return torch.zeros(self.num_envs, 4, device=self.device)
-        except Exception:
-            return torch.zeros(self.num_envs, 4, device=self.device)
+        """Get binary foot contact state (1=contact, 0=no contact)."""
+        force_threshold = 5.0
+        all_bodies, all_names = self._contact_sensor.find_bodies(".*")
+
+        foot_names = ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
+        feet_sensor_indices = []
+
+        for foot_name in foot_names:
+            for i, body_name in enumerate(all_names):
+                if foot_name.lower() in body_name.lower():
+                    feet_sensor_indices.append(i)
+                    break
+
+        binary_contact = torch.zeros(self.num_envs, 4, device=self.device)
+
+        if feet_sensor_indices and len(feet_sensor_indices) == 4:
+            foot_forces = torch.norm(self._contact_sensor.data.net_forces_w[:, feet_sensor_indices], dim=-1)
+            binary_contact = (foot_forces > force_threshold).float()
+
+        return binary_contact
 
     def _get_imu_data(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self._robot.data.projected_gravity_b, self._robot.data.root_ang_vel_b
 
     def _get_rewards(self) -> torch.Tensor:
-        contacts = self._get_foot_contact_binary()
-        contact_reward = (torch.sum(contacts, dim=1) / 4.0) * 2.0
+        # ==============================================================
+        # 1. LEG CONTACT
+        # ==============================================================
+        contact_binary = self._get_foot_contact_binary()
+        leg_contact_reward = (torch.sum(contact_binary, dim=1) / 4.0) * 2.0
+
+        # ==============================================================
+        # 2. IMU UPRIGHT
+        # ==============================================================
         gravity, _ = self._get_imu_data()
-        roll_pitch = torch.sqrt(gravity[:, 0] ** 2 + gravity[:, 1] ** 2)
-        upright_reward = torch.exp(-roll_pitch * 10.0) * 2.0
-        height = self._robot.data.root_pos_w[:, 2]
-        height_error = torch.abs(height - self._target_height)
-        height_reward = torch.exp(-height_error * 4.0) * 2.0
-        total_reward = contact_reward + upright_reward + height_reward
-        self._episode_sums["leg_contact_reward"] += contact_reward
-        self._episode_sums["imu_upright_reward"] += upright_reward
-        self._episode_sums["height_reward"] += height_reward
+        roll_pitch_error = torch.sqrt(gravity[:, 0]**2 + gravity[:, 1]**2)
+        imu_upright_reward = torch.exp(-roll_pitch_error * 5.0)
+
+        # ==============================================================
+        # 3. VISION HEIGHT
+        # ==============================================================
+        height_estimate = self._get_height_estimate(self.last_depth_maps)
+        height_error = torch.abs(height_estimate - 0.32)
+        height_reward = torch.exp(-height_error * 6.0) * 2.0
+
+        # ==============================================================
+        # 4. PITCH FROM DEPTH (left vs right ground)
+        # ==============================================================
+        h, w = self.last_depth_maps.shape[1], self.last_depth_maps.shape[2]
+        y1 = int(h * 0.88)
+        left  = np.mean(self.last_depth_maps[:, y1:, :w//3],      axis=(1,2))
+        right = np.mean(self.last_depth_maps[:, y1:, 2*w//3:],    axis=(1,2))
+        pitch_tilt = torch.tensor(left - right, device=self.device) / 100.0
+        pitch_reward = torch.exp(-pitch_tilt.abs() * 12.0) * 0.8
+
+        # ==============================================================
+        # 5. CRASH PENALTY
+        # ==============================================================
+        crash_penalty = torch.clamp(0.18 - height_estimate, 0.0, 0.2) * 40.0
+
+        # ==============================================================
+        # 6. TOTAL REWARD
+        # ==============================================================
+        total_reward = (
+            leg_contact_reward * 1.0 +
+            imu_upright_reward * 2.0 +
+            height_reward +
+            pitch_reward -
+            crash_penalty
+        )
+
+        # ==============================================================
+        # 7. LOUD & CLEAR LOGGING (every 50 steps)
+        # ==============================================================
+        if self.episode_length_buf[0] % 50 == 0:
+            print("\n" + "═" * 70, flush=True)
+            print(f" TRAINING PROGRESS - Step {self.episode_length_buf[0].item():,}", flush=True)
+            print(f"  Feet     : {contact_binary[0].tolist()}", flush=True)
+            print(f"  Height   : {height_estimate[0].item():.3f}m  (target 0.32m)", flush=True)
+            print(f"  Pitch    : {pitch_tilt[0].item():+.3f} rad  → Reward {pitch_reward[0].item():.3f}", flush=True)
+            print(f"  Rewards  : Leg {leg_contact_reward[0].item():.2f} | "
+                  f"IMU {imu_upright_reward[0].item():.2f} | "
+                  f"Height {height_reward[0].item():.2f} | "
+                  f"Pitch {pitch_reward[0].item():.2f} | "
+                  f"Crash -{crash_penalty[0].item():.1f}", flush=True)
+            print(f"  TOTAL    : {total_reward[0].item():.3f}", flush=True)
+            print("═" * 70, flush=True)
+
+        # ==============================================================
+        # 8. EPISODE SUMS (ALL REWARDS INCLUDED)
+        # ==============================================================
+        rewards_dict = {
+            "leg_contact_reward": leg_contact_reward,
+            "imu_upright_reward": imu_upright_reward,
+            "height_reward":      height_reward,
+            "pitch_reward":       pitch_reward,
+            "crash_penalty":      -crash_penalty  # negative for logging
+        }
+        for key, value in rewards_dict.items():
+            self._episode_sums[key] = self._episode_sums.get(key, 0) + value
+
         return total_reward
+
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         timeout = self.episode_length_buf >= self.max_episode_length - 1
