@@ -9,6 +9,8 @@ from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg, CameraCfg
+from isaaclab.sensors import RayCasterCfg
+from isaaclab.sensors.ray_caster import patterns
 from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
@@ -116,6 +118,20 @@ class Go1SceneCfg(InteractiveSceneCfg):
             rot=(0.0, -0.7071, 0.0, 0.7071),  # -90° around y-axis
             convention="ros"
         ),
+    )
+
+    raycaster = RayCasterCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/trunk",
+        update_period=0.0,
+        offset=RayCasterCfg.OffsetCfg(
+            pos=(0.20, 0.0, 0.0),  # 20cm forward from trunk center (near chin)
+            rot=(0.0, 0.0, 0.0, 1.0),  # Pointing downward
+        ),
+        ray_alignment="world",  # Rays point in world Z direction (down)
+        pattern_cfg=patterns.GridPatternCfg(resolution=0.2, size=[0.4, 0.4]),  # 3x3 grid = 9 rays
+        debug_vis=True,
+        max_distance=1.0,
+        mesh_prim_paths=["/World/ground"],
     )
 
 @configclass
