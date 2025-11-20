@@ -33,24 +33,24 @@ agent:
   class: PPO
   rollouts: 4096              # Increased for better sampling
   learning_epochs: 10         # Increased for better learning
-  mini_batches: 32            # Increased for better gradient estimates
+  mini_batches: 64            # Increased for better gradient estimates
   discount_factor: 0.99
   lambda: 0.95
   learning_rate: 1.0e-4       # Reduced for stability
   learning_rate_scheduler: null  # Remove adaptive LR for now
   state_preprocessor: null
   value_preprocessor: null
-  grad_norm_clip: 1.0
+  grad_norm_clip: 0.0
   ratio_clip: 0.2
   value_clip: 0.2
   clip_predicted_values: True
-  entropy_loss_scale: 0.01
+  entropy_loss_scale: 0.005
   value_loss_scale: 0.5
   experiment:
     directory: "go1_flat_direct"
     experiment_name: "go1_flat_fixed"
     write_interval: auto
-    checkpoint_interval: 1000
+    checkpoint_interval: 50000
 
 trainer:
   class: SequentialTrainer

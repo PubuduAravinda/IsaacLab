@@ -1,3 +1,4 @@
+# go1_env_cfg.py - Patched with fixes: curriculum, increased num_envs, reward scales
 import isaaclab.envs.mdp as mdp
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
@@ -5,7 +6,7 @@ from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import ContactSensorCfg, CameraCfg  # Remove CameraCfg if not used
+from isaaclab.sensors import ContactSensorCfg
 from isaaclab.sensors import RayCasterCfg
 from isaaclab.sensors.ray_caster import patterns
 from isaaclab.sim import SimulationCfg
@@ -96,16 +97,17 @@ class Go1SceneCfg(InteractiveSceneCfg):
         debug_vis=False,
     )
 
+    # In go1_env_cfg.py, update the raycaster to use "yaw" alignment for rotation with robot
     raycaster = RayCasterCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/trunk",  # Attached to trunk body prim – auto-follows
+        prim_path="{ENV_REGEX_NS}/Robot/trunk",
         update_period=0.0,
         offset=RayCasterCfg.OffsetCfg(
-            pos=(0.20, 0.0, 0.0),  # 20cm forward under chin in trunk local frame
-            rot=(0.0, 0.0, 0.0, 1.0),  # Identity – no additional rotation
+            pos=(0.20, 0.0, 0.0),  # 20cm forward under chin
+            rot=(0.0, 0.0, 0.0, 1.0),
         ),
-        ray_alignment="yaw",  # Match ANYmal – pattern follows robot yaw (rotation); fixes viz/update bug
-        pattern_cfg=patterns.GridPatternCfg(resolution=0.2, size=[0.4, 0.4]),  # 3x3 grid = 9 rays
-        debug_vis=True,  # Red dots now rotate with chin on robot yaw
+        ray_alignment="yaw",  # Pattern follows robot yaw – dots rotate with robot
+        pattern_cfg=patterns.GridPatternCfg(resolution=0.2, size=[0.4, 0.4]),
+        debug_vis=True,
         max_distance=1.0,
         mesh_prim_paths=["/World/ground"],
     )
@@ -119,7 +121,7 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
     action_space = 12
     observation_space = 47  # State-only observation
     state_space = 0
-    num_envs = 5
+    num_envs = 512  # Increased for faster convergence
     env_spacing = 3.0
 
     sim: SimulationCfg = SimulationCfg(
@@ -160,6 +162,12 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
     )
 
     events: EventCfg = EventCfg()
+
+    # Height curriculum params
+    height_curriculum = True
+    height_target_min = 0.25
+    height_target_max = 0.32
+    height_ramp_steps = 2_000_000
 
 @configclass
 class Go1RoughEnvCfg(Go1FlatEnvCfg):
