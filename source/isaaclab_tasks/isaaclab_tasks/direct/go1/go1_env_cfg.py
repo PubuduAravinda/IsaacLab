@@ -1,4 +1,4 @@
-# go1_env_cfg.py - Patched with fixes: curriculum, increased num_envs, reward scales
+# go1_env_cfg.py - Updated for variable impedance control
 import isaaclab.envs.mdp as mdp
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
@@ -97,7 +97,6 @@ class Go1SceneCfg(InteractiveSceneCfg):
         debug_vis=False,
     )
 
-    # In go1_env_cfg.py, update the raycaster to use "yaw" alignment for rotation with robot
     raycaster = RayCasterCfg(
         prim_path="{ENV_REGEX_NS}/Robot/trunk",
         update_period=0.0,
@@ -114,15 +113,19 @@ class Go1SceneCfg(InteractiveSceneCfg):
 
 @configclass
 class Go1FlatEnvCfg(DirectRLEnvCfg):
-    """Configuration for Go1 on flat terrain with carpet-like ground"""
+    """Configuration for Go1 on flat terrain with variable impedance control"""
     episode_length_s = 20.0
     decimation = 4
     action_scale = 1.0
-    action_space = 12
-    observation_space = 47  # State-only observation
+    action_space = 36  # 12 positions + 12 KP + 12 KD
+    observation_space = 71  # Increased because previous actions are now 36D
     state_space = 0
-    num_envs = 512  # Increased for faster convergence
+    num_envs = 512
     env_spacing = 3.0
+
+    # PD gain ranges for scaling policy outputs
+    kp_range = (20.0, 100.0)   # Min and max KP values
+    kd_range = (1.0, 5.0)      # Min and max KD values
 
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 200,

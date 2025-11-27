@@ -1,4 +1,4 @@
-# go1_env.py - FINAL STABLE VERSION with raycaster and proven rewards
+# go1_env.py - SIMPLIFIED with detailed debugging and removed velocity/torque penalties
 import gymnasium as gym
 import torch
 import isaaclab.sim as sim_utils
@@ -19,26 +19,30 @@ class Go1Env(DirectRLEnv):
 
     def __init__(self, cfg: Go1FlatEnvCfg | Go1RoughEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
-        print("🤖 Go1 Environment - Stable Standing Training")
+        print("🤖 Go1 Environment - Simplified Variable Impedance Control")
+        print(f"🎯 Action Space: {self.cfg.action_space}D (12 pos + 12 KP + 12 KD)")
 
-        self._actions = torch.zeros(self.num_envs, 12, device=self.device)
+        # Now actions are 36D: [positions(12), kp(12), kd(12)]
+        self._actions = torch.zeros(self.num_envs, 36, device=self.device)
         self._previous_actions = torch.zeros_like(self._actions)
-        self._processed_actions = torch.zeros_like(self._actions)
+
+        # Separate tensors for each component
+        self._target_positions = torch.zeros(self.num_envs, 12, device=self.device)
+        self._kp_gains = torch.zeros(self.num_envs, 12, device=self.device)
+        self._kd_gains = torch.zeros(self.num_envs, 12, device=self.device)
 
         self._episode_sums = {
             "leg_contact_reward": torch.zeros(self.num_envs, device=self.device),
             "imu_upright_reward": torch.zeros(self.num_envs, device=self.device),
             "height_reward": torch.zeros(self.num_envs, device=self.device),
-            "velocity_reward": torch.zeros(self.num_envs, device=self.device),
-            "torque_penalty": torch.zeros(self.num_envs, device=self.device),
-            # REMOVED: "action_smoothness_penalty"
         }
 
         self._target_height = 0.32
         self._global_step = 0
 
         # Height curriculum
-        self._height_target = torch.full((self.num_envs,), self.cfg.height_target_min, dtype=torch.float, device=self.device)
+        self._height_target = torch.full((self.num_envs,), self.cfg.height_target_min, dtype=torch.float,
+                                         device=self.device)
 
         # DEBUG MODE
         self._debug_camera_mode = False
@@ -46,11 +50,19 @@ class Go1Env(DirectRLEnv):
 
         self._trunk_idx = self._robot.find_bodies("trunk")[0]
 
-        # Height tracking - KEEP YOUR RAYCASTER
+        # Height tracking
         self._raycaster_height = torch.zeros(self.num_envs, device=self.device)
         self._height_errors = []
 
+        # Store previous state for debugging
+        self._prev_joint_pos = torch.zeros(self.num_envs, 12, device=self.device)
+        self._prev_root_pos = torch.zeros(self.num_envs, 3, device=self.device)
+
     def step(self, actions: torch.Tensor):
+        # Store state before applying action
+        self._prev_joint_pos = self._robot.data.joint_pos.clone()
+        self._prev_root_pos = self._robot.data.root_pos_w.clone()
+
         self._global_step += 1
         return super().step(actions)
 
@@ -145,38 +157,35 @@ class Go1Env(DirectRLEnv):
         if self._debug_camera_mode and self._debug_steps < 100:
             self._debug_steps += 1
             self._actions = torch.zeros_like(actions)
-            self._processed_actions = self._robot.data.default_joint_pos
+            # Use default positions and medium gains for debug
+            self._target_positions = self._robot.data.default_joint_pos
+            self._kp_gains = torch.full((self.num_envs, 12), 50.0, device=self.device)
+            self._kd_gains = torch.full((self.num_envs, 12), 2.5, device=self.device)
         else:
-            # Simple action scaling
+            # Split the 36D action into components
+            actions = torch.clamp(actions, -3.0, 3.0)  # Prevent extreme actions
             self._actions = actions.clone()
-            self._processed_actions = self.cfg.action_scale * self._actions + self._robot.data.default_joint_pos
+
+            # First 12: position targets (scaled as before)
+            pos_actions = actions[:, 0:12]
+            self._target_positions = self.cfg.action_scale * pos_actions + self._robot.data.default_joint_pos
+
+            # Next 12: KP gains (scaled from [-1,1] to [kp_min, kp_max] and CLAMPED)
+            kp_actions = actions[:, 12:24]
+            kp_min, kp_max = self.cfg.kp_range
+            self._kp_gains = (kp_actions + 1.0) * 0.5 * (kp_max - kp_min) + kp_min
+            self._kp_gains = torch.clamp(self._kp_gains, kp_min, kp_max)
+
+            # Last 12: KD gains (scaled from [-1,1] to [kd_min, kd_max] and CLAMPED)
+            kd_actions = actions[:, 24:36]
+            kd_min, kd_max = self.cfg.kd_range
+            self._kd_gains = (kd_actions + 1.0) * 0.5 * (kd_max - kd_min) + kd_min
+            self._kd_gains = torch.clamp(self._kd_gains, kd_min, kd_max)
 
     def _apply_action(self):
-        self._robot.set_joint_position_target(self._processed_actions)
+        """Apply actions - IsaacLab handles PD gains internally"""
+        self._robot.set_joint_position_target(self._target_positions)
         self.scene.write_data_to_sim()
-
-    def _debug_system_status(self):
-        env_idx = 0
-        root_pos = self._robot.data.root_pos_w[env_idx]
-        root_rot = self._robot.data.root_quat_w[env_idx]
-
-        w, x, y, z = root_rot
-        roll = torch.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
-        pitch = torch.asin(2 * (w * y - z * x))
-        roll_deg = roll.item() * 180 / np.pi
-        pitch_deg = pitch.item() * 180 / np.pi
-
-        joint_pos = self._robot.data.joint_pos[env_idx]
-        default_joint_pos = self._robot.data.default_joint_pos[env_idx]
-        joint_diff = torch.norm(joint_pos - default_joint_pos).item()
-
-        raycaster_h = self._raycaster_height[env_idx].item()
-
-        # print(f"\n📊 SYSTEM STATUS (env {env_idx}, step {self._global_step}):")
-        # print(f"🤖 Robot: Pos[{root_pos[0]:.3f}, {root_pos[1]:.3f}, {root_pos[2]:.3f}] "
-        #       f"Rot[Roll={roll_deg:5.1f}°, Pitch={pitch_deg:5.1f}°] "
-        #       f"Joints[{joint_diff:5.3f}]")
-        # print(f"📏 Raycaster Height: {raycaster_h:5.3f}m")
 
     def _get_observations(self) -> dict:
         self._previous_actions = self._actions.clone()
@@ -196,11 +205,6 @@ class Go1Env(DirectRLEnv):
         self._raycaster_height = raycaster_height
         height_estimate = raycaster_height.unsqueeze(1) if raycaster_height.dim() == 1 else raycaster_height
 
-        # Debug
-        if (self._debug_camera_mode and (self._debug_steps <= 10 or self._debug_steps % 20 == 0)) or (
-                self._global_step % 100 == 0):
-            self._debug_system_status()
-
         # Final observation
         obs = torch.cat([
             gravity,  # (num_envs, 3)
@@ -209,7 +213,7 @@ class Go1Env(DirectRLEnv):
             joint_pos,  # (num_envs, 12)
             joint_vel,  # (num_envs, 12)
             height_estimate,  # (num_envs, 1)
-            self._actions  # (num_envs, 12)
+            self._actions  # (num_envs, 36) - ALL components now!
         ], dim=-1)
 
         return {"policy": obs}
@@ -238,72 +242,98 @@ class Go1Env(DirectRLEnv):
         return self._robot.data.projected_gravity_b, self._robot.data.root_ang_vel_b
 
     def _get_rewards(self) -> torch.Tensor:
-        """PROVEN STABLE REWARD STRUCTURE - NO SMOOTHNESS PENALTY"""
-        # 1. Contact - PROVEN COEFFICIENTS
+        """SIMPLIFIED REWARD STRUCTURE"""
+        env_idx = 0  # Focus on first environment for debugging
+
+        # 1. Contact reward
         contact_binary = self._get_foot_contact_binary()
         num_feet_contact = torch.sum(contact_binary, dim=1)
         leg_contact_reward = (num_feet_contact / 4.0) * 2.0  # Max 2.0
 
-        # 2. Upright - PROVEN COEFFICIENTS
+        # 2. Upright reward
         roll_pitch_error = torch.sqrt(self._robot.data.projected_gravity_b[:, 0] ** 2 +
                                       self._robot.data.projected_gravity_b[:, 1] ** 2)
         imu_upright_reward = torch.exp(-roll_pitch_error * 5.0)  # Max ~1.0
 
-        # 3. Height - PROVEN COEFFICIENTS
+        # 3. Height reward
         height_error = torch.abs(self._raycaster_height - self._height_target)
         height_reward = torch.exp(-height_error * 4.0)  # Max ~1.0
 
-        # 4. Low velocity - ENCOURAGE STANDING STILL
-        vel = torch.norm(self._robot.data.root_lin_vel_b[:, :3], dim=1) + \
-              0.3 * torch.norm(self._robot.data.root_ang_vel_b[:, :3], dim=1)
-        velocity_reward = torch.exp(-vel * 4.0) * 0.5  # Max 0.5
-
-        # 5. Penalties - MILD COEFFICIENTS
-        torque_penalty = -1e-6 * torch.sum(self._robot.data.applied_torque ** 2, dim=1)
-
-        # 6. NO SMOOTHNESS PENALTY - THIS CAUSES EXPLOSION
-
-        # 7. Crash penalty - ONLY for very low heights
+        # 4. Crash penalty
         crash_penalty = torch.where(self._raycaster_height < 0.20,
-                                    5.0 * (0.20 - self._raycaster_height),  # MILD penalty
+                                    5.0 * (0.20 - self._raycaster_height),
                                     torch.zeros_like(self._raycaster_height))
 
-        # 8. Alive bonus
+        # 5. Alive bonus
         alive_bonus = 0.1
 
-        # TOTAL REWARD - PROVEN BALANCE
+        # TOTAL REWARD - SIMPLIFIED
         total_reward = (leg_contact_reward * 1.0 +
                         imu_upright_reward * 2.0 +
                         height_reward * 2.0 +
-                        velocity_reward +
-                        torque_penalty +
                         alive_bonus -
                         crash_penalty)
 
-        # NaN protection
-        if torch.any(torch.isnan(total_reward)):
-            print("NaN detected in reward! Clamping...")
-            total_reward = torch.nan_to_num(total_reward, nan=0.0)
+        # DETAILED DEBUGGING - Print every 500 steps
+        if self._global_step % 500 == 0:
+            print("\n" + "═" * 120)
+            print(f"🚀 STEP {self._global_step} - ENV {env_idx}")
+            print("═" * 120)
 
-        # Logging
-        if self._global_step % 200 == 0:
-            print("\n" + "═" * 75)
-            print(f" TRAINING STEP {self._global_step // 1000}k | Episode {self.episode_length_buf[0].item()}")
-            print(f" Height: {self._raycaster_height[0]:.3f}m (target {self._height_target[0]:.3f}m)")
-            print(f" Feet: {contact_binary[0].tolist()}")
-            print(f" Rewards → Contact:{leg_contact_reward[0]:.2f}  Upright:{imu_upright_reward[0]:.2f}  "
-                  f"Height:{height_reward[0]:.2f}  Vel:{velocity_reward[0]:.2f}  Alive:+0.10")
-            print(f" Penalties → Torque:{torque_penalty[0]:.6f}  Crash:-{crash_penalty[0]:.1f}")
-            print(f" TOTAL REWARD: {total_reward[0]:.3f}")
-            print("═" * 75)
+            # Current state
+            current_height = self._raycaster_height[env_idx].item()
+            current_roll_pitch = roll_pitch_error[env_idx].item()
+            current_contacts = contact_binary[env_idx].cpu().numpy()
+
+            print(f"📊 CURRENT STATE:")
+            print(f"   Height: {current_height:.3f}m (target: {self._height_target[env_idx]:.3f}m)")
+            print(f"   Tilt error: {current_roll_pitch:.3f}")
+            print(f"   Foot contacts: {current_contacts}")
+            print(
+                f"   Root position: [{self._prev_root_pos[env_idx, 0]:.2f}, {self._prev_root_pos[env_idx, 1]:.2f}, {self._prev_root_pos[env_idx, 2]:.2f}]")
+
+            print(f"   Prev Joint Positions: {self._prev_joint_pos[env_idx].cpu().numpy().round(3)}")
+            # Calculate actual joint position changes (12D vector)
+            joint_pos_change = torch.abs(self._robot.data.joint_pos[env_idx] - self._prev_joint_pos[env_idx])
+
+            # Actions (positions, KP, KD) - ALL 12 DIMENSIONS
+            print(f"🎯 ACTIONS APPLIED (12D vectors):")
+            print(f"   Target Positions: {self._target_positions[env_idx].cpu().numpy().round(3)}")
+            print(f"   KP Gains:         {self._kp_gains[env_idx].cpu().numpy().round(2)}")
+            print(f"   KD Gains:         {self._kd_gains[env_idx].cpu().numpy().round(2)}")
+
+            tracking_error = torch.abs(self._robot.data.joint_pos[env_idx] - self._target_positions[env_idx])
+            print(f"   Tracking Errors: {tracking_error.cpu().numpy().round(3)}")
+
+            # Next state (after action) - Show joint positions
+            current_joint_pos = self._robot.data.joint_pos[env_idx].cpu().numpy()
+            next_root_pos = self._robot.data.root_pos_w[env_idx].cpu().numpy()
+
+            print(f"📈 NEXT STATE (after action):")
+            print(f"   Joint positions:    {current_joint_pos.round(3)}")
+            print(f"   Joint pos changes:  {joint_pos_change.cpu().numpy().round(3)}")
+            print(f"   Root position: [{next_root_pos[0]:.2f}, {next_root_pos[1]:.2f}, {next_root_pos[2]:.2f}]")
+
+            # Show which joints moved the most
+            max_change_idx = torch.argmax(joint_pos_change).item()
+            max_change_val = joint_pos_change[max_change_idx].item()
+            print(f"   Most movement: Joint {max_change_idx} changed by {max_change_val:.3f} rad")
+
+            # Rewards breakdown
+            print(f"💰 REWARDS:")
+            print(f"   Contact: {leg_contact_reward[env_idx]:.2f} (feet: {num_feet_contact[env_idx].item()}/4)")
+            print(f"   Upright: {imu_upright_reward[env_idx]:.2f} (tilt: {current_roll_pitch:.3f})")
+            print(f"   Height:  {height_reward[env_idx]:.2f} (error: {height_error[env_idx]:.3f})")
+            print(f"   Alive:   +{alive_bonus:.2f}")
+            print(f"   Crash:   -{crash_penalty[env_idx]:.2f}")
+            print(f"   TOTAL:   {total_reward[env_idx]:.3f}")
+            print("═" * 120)
 
         # Accumulate for episode stats
         rewards_to_sum = {
             "leg_contact_reward": leg_contact_reward,
             "imu_upright_reward": imu_upright_reward,
             "height_reward": height_reward,
-            "velocity_reward": velocity_reward,
-            "torque_penalty": torque_penalty,
         }
         for k, v in rewards_to_sum.items():
             self._episode_sums[k] += v
@@ -324,10 +354,12 @@ class Go1Env(DirectRLEnv):
 
         super()._reset_idx(env_ids)
 
-        # Reset actions
+        # Reset actions (now 36D)
         self._actions[env_ids] = 0.0
         self._previous_actions[env_ids] = 0.0
-        self._processed_actions[env_ids] = 0.0
+        self._target_positions[env_ids] = 0.0
+        self._kp_gains[env_ids] = 50.0
+        self._kd_gains[env_ids] = 2.5
 
         # Reset robot to default standing pose
         joint_pos = self._robot.data.default_joint_pos[env_ids]
