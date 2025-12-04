@@ -34,8 +34,7 @@ class Go1Env(DirectRLEnv):
         self._episode_sums = {
             "leg_contact_reward": torch.zeros(self.num_envs, device=self.device),
             "imu_upright_reward": torch.zeros(self.num_envs, device=self.device),
-            "stability_reward": torch.zeros(self.num_envs, device=self.device),
-            "joint_limit_penalty": torch.zeros(self.num_envs, device=self.device),
+            "height_reward": torch.zeros(self.num_envs, device=self.device),
         }
 
         self._target_height = 0.32
@@ -243,36 +242,37 @@ class Go1Env(DirectRLEnv):
         return self._robot.data.projected_gravity_b, self._robot.data.root_ang_vel_b
 
     def _get_rewards(self) -> torch.Tensor:
-        """REWARD STRUCTURE FOR REAL GO1 - IMU + FOOT SENSORS ONLY"""
-        env_idx = 0
+        """SIMPLIFIED REWARD STRUCTURE"""
+        env_idx = 0  # Focus on first environment for debugging
 
-        # 1. Contact reward (foot pressure sensors)
+        # 1. Contact reward
         contact_binary = self._get_foot_contact_binary()
         num_feet_contact = torch.sum(contact_binary, dim=1)
         leg_contact_reward = (num_feet_contact / 4.0) * 2.0  # Max 2.0
 
-        # 2. Upright reward (IMU orientation)
+        # 2. Upright reward
         roll_pitch_error = torch.sqrt(self._robot.data.projected_gravity_b[:, 0] ** 2 +
                                       self._robot.data.projected_gravity_b[:, 1] ** 2)
         imu_upright_reward = torch.exp(-roll_pitch_error * 5.0)  # Max ~1.0
 
-        # 3. Stability reward (IMU angular velocity) - NEW!
-        angular_vel_magnitude = torch.norm(self._robot.data.root_ang_vel_b[:, :2], dim=1)
-        stability_reward = torch.exp(-angular_vel_magnitude * 2.0)  # Penalize fast rotations
+        # 3. Height reward
+        height_error = torch.abs(self._raycaster_height - self._height_target)
+        height_reward = torch.exp(-height_error * 4.0)  # Max ~1.0
 
-        # 4. Joint limit penalty - NEW!
-        joint_limit_penalty = -0.01 * torch.sum(
-            torch.abs(self._robot.data.joint_pos - self._robot.data.default_joint_pos), dim=1)
+        # 4. Crash penalty
+        crash_penalty = torch.where(self._raycaster_height < 0.20,
+                                    5.0 * (0.20 - self._raycaster_height),
+                                    torch.zeros_like(self._raycaster_height))
 
         # 5. Alive bonus
         alive_bonus = 0.1
 
-        # TOTAL REWARD - NO HEIGHT COMPONENTS
+        # TOTAL REWARD - SIMPLIFIED
         total_reward = (leg_contact_reward * 1.0 +
                         imu_upright_reward * 2.0 +
-                        stability_reward * 1.0 +
-                        joint_limit_penalty +
-                        alive_bonus)
+                        height_reward * 2.0 +
+                        alive_bonus -
+                        crash_penalty)
 
         # DETAILED DEBUGGING - Print every 500 steps
         if self._global_step % 500 == 0:
@@ -283,18 +283,16 @@ class Go1Env(DirectRLEnv):
             # Current state
             current_height = self._raycaster_height[env_idx].item()
             current_roll_pitch = roll_pitch_error[env_idx].item()
-            current_angular_vel = angular_vel_magnitude[env_idx].item()
             current_contacts = contact_binary[env_idx].cpu().numpy()
 
             print(f"📊 CURRENT STATE:")
-            print(f"   Height: {current_height:.3f}m (not used in reward)")
+            print(f"   Height: {current_height:.3f}m (target: {self._height_target[env_idx]:.3f}m)")
             print(f"   Tilt error: {current_roll_pitch:.3f}")
-            print(f"   Angular velocity: {current_angular_vel:.3f}")
             print(f"   Foot contacts: {current_contacts}")
             print(
                 f"   Root position: [{self._prev_root_pos[env_idx, 0]:.2f}, {self._prev_root_pos[env_idx, 1]:.2f}, {self._prev_root_pos[env_idx, 2]:.2f}]")
-            print(f"   Prev Joint Positions: {self._prev_joint_pos[env_idx].cpu().numpy().round(3)}")
 
+            print(f"   Prev Joint Positions: {self._prev_joint_pos[env_idx].cpu().numpy().round(3)}")
             # Calculate actual joint position changes (12D vector)
             joint_pos_change = torch.abs(self._robot.data.joint_pos[env_idx] - self._prev_joint_pos[env_idx])
 
@@ -321,13 +319,13 @@ class Go1Env(DirectRLEnv):
             max_change_val = joint_pos_change[max_change_idx].item()
             print(f"   Most movement: Joint {max_change_idx} changed by {max_change_val:.3f} rad")
 
-            # Rewards breakdown - UPDATED FOR NEW REWARD STRUCTURE
+            # Rewards breakdown
             print(f"💰 REWARDS:")
             print(f"   Contact: {leg_contact_reward[env_idx]:.2f} (feet: {num_feet_contact[env_idx].item()}/4)")
             print(f"   Upright: {imu_upright_reward[env_idx]:.2f} (tilt: {current_roll_pitch:.3f})")
-            print(f"   Stability: {stability_reward[env_idx]:.2f} (ang_vel: {current_angular_vel:.3f})")
-            print(f"   Joint limit: {joint_limit_penalty[env_idx]:.3f}")
+            print(f"   Height:  {height_reward[env_idx]:.2f} (error: {height_error[env_idx]:.3f})")
             print(f"   Alive:   +{alive_bonus:.2f}")
+            print(f"   Crash:   -{crash_penalty[env_idx]:.2f}")
             print(f"   TOTAL:   {total_reward[env_idx]:.3f}")
             print("═" * 120)
 
@@ -335,8 +333,7 @@ class Go1Env(DirectRLEnv):
         rewards_to_sum = {
             "leg_contact_reward": leg_contact_reward,
             "imu_upright_reward": imu_upright_reward,
-            "stability_reward": stability_reward,
-            "joint_limit_penalty": joint_limit_penalty,
+            "height_reward": height_reward,
         }
         for k, v in rewards_to_sum.items():
             self._episode_sums[k] += v
@@ -344,14 +341,11 @@ class Go1Env(DirectRLEnv):
         return total_reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Termination condition - only use tilt for falling detection (no height)"""
         timeout = self.episode_length_buf >= self.max_episode_length - 1
         gravity, _ = self._get_imu_data()
         roll_pitch = torch.sqrt(gravity[:, 0] ** 2 + gravity[:, 1] ** 2)
-
-        # Only terminate if robot tilts too much (no height check)
-        died = roll_pitch > 0.8
-
+        height = self._robot.data.root_pos_w[:, 2]
+        died = torch.logical_or(roll_pitch > 0.8, height < 0.2)
         return died, timeout
 
     def _reset_idx(self, env_ids: torch.Tensor):
