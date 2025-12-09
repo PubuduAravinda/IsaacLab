@@ -1,9 +1,8 @@
-# agents/rl_games_flat_ppo_cfg.yaml - CORRECTED for Isaac Lab 2.2.1
+# agents/rl_games_flat_ppo_cfg.yaml - CORRECTED per HIMLoco recommendations
 
 params:
   seed: 42
 
-  # ← THIS WAS MISSING! env section required by train.py line 154
   env:
     clip_actions: 1.0
 
@@ -65,9 +64,9 @@ params:
     kl_threshold: 0.016
 
     score_to_win: 20000
-    max_epochs: 1000000
-    save_best_after: 100
-    save_frequency: 500
+    max_epochs: 2000  # ← CRITICAL: HIMLoco recommends max 2000!
+    save_best_after: 50
+    save_frequency: 100
     print_stats: True
     grad_norm: 1.0
     entropy_coef: 0.01

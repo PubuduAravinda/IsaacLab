@@ -70,6 +70,20 @@ class Go1Env(DirectRLEnv):
         self._robot = self.scene["robot"]
         self._contact_sensor = self.scene["contact_sensor"]
 
+        # Debug: Print robot structure (only once)
+        if not hasattr(self, '_printed_structure'):
+            print("\n" + "=" * 80)
+            print("🔍 Go1 Robot USD Structure:")
+            print("=" * 80)
+            try:
+                # This will be available after physics initialization
+                print(f"Robot bodies will be available after first step")
+                print(f"Default joint positions: {self._robot.data.default_joint_pos[0]}")
+            except:
+                print("(Structure will be printed after first physics step)")
+            print("=" * 80 + "\n")
+            self._printed_structure = True
+
     def _pre_physics_step(self, actions: torch.Tensor):
         """Process actions before physics step"""
         # Clip and store actions
@@ -136,7 +150,20 @@ class Go1Env(DirectRLEnv):
         # Initialize feet indices on first call (after physics is ready)
         if self.feet_indices is None:
             self.feet_indices = self._robot.find_bodies(["FL_foot", "FR_foot", "RL_foot", "RR_foot"])[0]
-            print(f"✓ Foot indices initialized: {self.feet_indices}")
+
+            # Debug: Print full robot structure
+            print("\n" + "=" * 80)
+            print("🦿 Go1 Robot Body Structure (from USD):")
+            print("=" * 80)
+            all_bodies = self._robot.body_names
+            print(f"Total bodies: {len(all_bodies)}")
+            print(f"All body names: {all_bodies}")
+            print(f"\n✓ Foot body indices found: {self.feet_indices}")
+            print(f"  FL_foot: index {self.feet_indices[0]}")
+            print(f"  FR_foot: index {self.feet_indices[1]}")
+            print(f"  RL_foot: index {self.feet_indices[2]}")
+            print(f"  RR_foot: index {self.feet_indices[3]}")
+            print("=" * 80 + "\n")
 
         force_threshold = 5.0
 
@@ -166,6 +193,8 @@ class Go1Env(DirectRLEnv):
         base_ang_vel = self._robot.data.root_ang_vel_b
         base_height = self._robot.data.root_pos_w[:, 2]
         projected_gravity = self._robot.data.projected_gravity_b
+        joint_pos = self._robot.data.joint_pos - self._robot.data.default_joint_pos
+        joint_vel = self._robot.data.joint_vel
         dof_acc = self._robot.data.joint_acc
 
         # Foot positions and velocities
@@ -220,6 +249,26 @@ class Go1Env(DirectRLEnv):
             dim=1
         ) * 0.01
 
+        # MISSING CRITICAL TERMS FROM HIMLOCO:
+        # 10. Joint position limits penalty (keeps joints in safe range)
+        joint_pos_limits = -torch.sum(
+            torch.abs(joint_pos) ** 2,
+            dim=1
+        ) * 0.001
+
+        # 11. Joint velocity penalty (prevents excessive speeds)
+        joint_vel_penalty = -torch.sum(
+            joint_vel ** 2,
+            dim=1
+        ) * 0.0001
+
+        # 12. Torque penalty (energy efficiency)
+        torques = self._robot.data.applied_torque
+        torque_penalty = -torch.sum(
+            torques ** 2,
+            dim=1
+        ) * 1e-5
+
         # Total reward
         total_reward = (
                 tracking_lin_vel +
@@ -230,7 +279,10 @@ class Go1Env(DirectRLEnv):
                 base_height_reward +
                 foot_clearance +
                 dof_acc_penalty +
-                action_rate
+                action_rate +
+                joint_pos_limits +
+                joint_vel_penalty +
+                torque_penalty
         )
 
         # Accumulate episode statistics
@@ -307,7 +359,7 @@ class Go1Env(DirectRLEnv):
 
         root_state = self._robot.data.default_root_state[env_ids].clone()
         root_state[:, :3] += self.scene.env_origins[env_ids]
-        root_state[:, 2] = 0.35  # Start slightly elevated
+        root_state[:, 2] = 0.42  # Start higher to avoid ground penetration
 
         # Write state to simulation
         self._robot.write_root_pose_to_sim(root_state[:, :7], env_ids)
