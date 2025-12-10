@@ -71,9 +71,9 @@ class Go1SceneCfg(InteractiveSceneCfg):
         actuators={
             "legs": ImplicitActuatorCfg(
                 joint_names_expr=[".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"],
-                stiffness=25.0,  # Lower stiffness for smoother motion
-                damping=0.5,
-                effort_limit=33.5,
+                stiffness=20.0,  # legged_gym Go1 default
+                damping=0.5,  # legged_gym Go1 default
+                effort_limit=23.5,  # Go1 spec (not 33.5)
             ),
         },
     )
@@ -107,8 +107,8 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
     action_space = spaces.Box(low=-1.0, high=1.0, shape=(12,), dtype=np.float32)
     state_space = spaces.Box(low=-np.inf, high=np.inf, shape=(0,), dtype=np.float32)
 
-    # Action scaling - MORE CONSERVATIVE
-    action_scale = 0.25  # Reduced from 0.5
+    # Action scaling - CRITICAL: legged_gym Go1 uses 0.25
+    action_scale = 0.25
 
     # Velocity commands - LIMITED for small dogs per HIMLoco issue #6
     commands = mdp.commands.UniformVelocityCommandCfg(

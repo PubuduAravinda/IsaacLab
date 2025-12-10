@@ -1,4 +1,4 @@
-# agents/rl_games_flat_ppo_cfg.yaml - CORRECTED per HIMLoco recommendations
+# agents/rl_games_flat_ppo_cfg.yaml - CORRECTED for 4096 envs
 
 params:
   seed: 42
@@ -50,7 +50,7 @@ params:
     normalize_input: True
     normalize_value: True
     value_bootstrap: True
-    num_actors: -1
+    num_actors: -1  # Set from --num_envs at runtime
 
     reward_shaper:
       scale_value: 0.1
@@ -64,7 +64,7 @@ params:
     kl_threshold: 0.016
 
     score_to_win: 20000
-    max_epochs: 2000  # ← CRITICAL: HIMLoco recommends max 2000!
+    max_epochs: 3000  # Try more than 2000 if needed
     save_best_after: 50
     save_frequency: 100
     print_stats: True
@@ -73,9 +73,11 @@ params:
     truncate_grads: True
     e_clip: 0.2
 
-    horizon_length: 24
-    minibatch_size: 1080
-    mini_epochs: 5
+    # CRITICAL: These must match for 4096 envs
+    horizon_length: 24  # Timesteps per rollout
+    minibatch_size: 24576  # num_envs (4096) * horizon_length (24) / mini_epochs (4) = 24576
+    mini_epochs: 4  # Changed from 5 to match batch size
+
     critic_coef: 2.0
     clip_value: True
     seq_len: 4
