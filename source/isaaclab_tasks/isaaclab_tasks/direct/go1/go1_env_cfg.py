@@ -100,10 +100,8 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
     env_spacing = 3.0
 
     # HIMLoco history
-    history_length = 3
-
-    # Observation space: 49D base × 3 history = 147D
-    observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(147,), dtype=np.float32)
+    history_length = 5
+    observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(64,), dtype=np.float32)
     action_space = spaces.Box(low=-1.0, high=1.0, shape=(12,), dtype=np.float32)
     state_space = spaces.Box(low=-np.inf, high=np.inf, shape=(0,), dtype=np.float32)
 
