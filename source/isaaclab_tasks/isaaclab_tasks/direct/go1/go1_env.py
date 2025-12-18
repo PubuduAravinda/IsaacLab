@@ -16,17 +16,15 @@ class SwAVLoss(nn.Module):
     def sinkhorn(self, scores):
         Q = torch.exp(scores / self.epsilon)
         Q /= Q.sum(dim=-1, keepdim=True)
-        K = Q.shape[-1]
         for _ in range(self.iters):
             Q /= Q.sum(dim=0, keepdim=True)
             Q /= Q.sum(dim=-1, keepdim=True)
-        Q *= K
         return Q
 
-    def forward(self, z_s, z_t):
+    def forward(self, z_s, z_t, prototypes):
         z_s = F.normalize(z_s, dim=1)
         z_t = F.normalize(z_t, dim=1)
-        P = F.normalize(self.prototypes.weight, dim=1)
+        P = F.normalize(prototypes, dim=0)  # normalize prototypes (columns)
 
         scores_s = z_s @ P.t() / self.tau
         scores_t = z_t @ P.t() / self.tau
@@ -38,8 +36,8 @@ class SwAVLoss(nn.Module):
         P_t = F.softmax(scores_t, dim=-1)
 
         loss = -0.5 * (
-            (Q_s * (Q_s.add(1e-8).log() - P_t.detach().log())).sum(-1).mean() +
-            (Q_t * (Q_t.add(1e-8).log() - P_s.detach().log())).sum(-1).mean()
+            (Q_s * torch.log(P_t.detach() + 1e-8)).sum(-1).mean() +
+            (Q_t * torch.log(P_s.detach() + 1e-8)).sum(-1).mean()
         )
         return loss
 
@@ -49,35 +47,28 @@ class Go1Env(DirectRLEnv):
         super().__init__(cfg, render_mode, **kwargs)
 
         print("\n" + "="*80)
-        print("REAL HIMLoco — J_v + J_SwAV — 100% WORKING (DEC 2025)")
+        print("HIMLoco Replication — Ready for RSL_RL (Aux losses active, target unfrozen)")
         print("="*80 + "\n")
 
         self.command_manager = UniformVelocityCommand(cfg=self.cfg.commands, env=self)
 
-        # HIM ENCODERS
-        self.encoder_source = nn.Sequential(
-            nn.Linear(45*5, 512), nn.ReLU(),
-            nn.Linear(512, 256), nn.ReLU(),
-            nn.Linear(256, 128), nn.ReLU(),
-            nn.Linear(128, 19)
-        ).to(self.device)
+        # HIM Encoders (both trainable — unfrozen target for aux optimization)
+        def make_encoder():
+            return nn.Sequential(
+                nn.Linear(45 * 5, 512), nn.ReLU(),
+                nn.Linear(512, 256), nn.ReLU(),
+                nn.Linear(256, 128), nn.ReLU(),
+                nn.Linear(128, 19)
+            ).to(self.device)
 
-        self.encoder_target = nn.Sequential(
-            nn.Linear(45*5, 512), nn.ReLU(),
-            nn.Linear(512, 256), nn.ReLU(),
-            nn.Linear(256, 128), nn.ReLU(),
-            nn.Linear(128, 19)
-        ).to(self.device)
-
-        for p in self.encoder_target.parameters():
-            p.requires_grad = False
+        self.encoder_source = make_encoder()
+        self.encoder_target = make_encoder()  # UNFROZEN — will be updated via aux losses in RSL_RL
 
         self.prototypes = nn.Parameter(torch.randn(16, 16))
-        nn.init.kaiming_normal_(self.prototypes, mode='fan_out', nonlinearity='relu')
+        nn.init.normal_(self.prototypes, std=0.01)
 
         self.vel_loss_fn = nn.MSELoss()
         self.swav_loss = SwAVLoss(K=16, tau=0.1).to(self.device)
-        self.swav_loss.prototypes = self.prototypes
 
         # Buffers
         self._actions = torch.zeros(self.num_envs, 12, device=self.device)
@@ -94,9 +85,15 @@ class Go1Env(DirectRLEnv):
 
         self._global_step = 0
 
+        # Foot indices for clearance reward
+        foot_names = ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
+        self.foot_indices = torch.tensor(
+            [self._robot.find_bodies(name)[0] for name in foot_names],
+            device=self.device, dtype=torch.long
+        )
+
     def _setup_scene(self):
         self._robot = self.scene["robot"]
-        self._contact_sensor = self.scene["contact_sensor"]  # kept for potential future use
 
     def _pre_physics_step(self, actions: torch.Tensor):
         actions = torch.clamp(actions, -1.0, 1.0)
@@ -131,13 +128,12 @@ class Go1Env(DirectRLEnv):
             emb_target = self.encoder_target(history_flat)
         emb_source = self.encoder_source(history_flat)
 
-        policy_obs = torch.cat([base_obs, emb_source], dim=1)
+        policy_obs = torch.cat([base_obs, emb_source], dim=1)  # 64D
 
-        # FIXED: detach before .numpy()
         if self._global_step % 1000 == 0:
             v = emb_source[0, :3].detach().cpu().numpy()
             l_norm = emb_source[0, 3:].detach().norm().item()
-            print(f"\nHIM | v_hat: {v} | l_norm: {l_norm:.3f}")
+            print(f"\nHIM | Step {self._global_step} | v_hat: {v} | l_norm: {l_norm:.3f}")
 
         self._global_step += 1
         return {"policy": policy_obs, "critic": policy_obs}
@@ -148,12 +144,11 @@ class Go1Env(DirectRLEnv):
 
         history_flat = self.obs_history.reshape(self.num_envs, -1)
         emb_source = self.encoder_source(history_flat)
-        with torch.no_grad():
-            emb_target = self.encoder_target(history_flat)
+        emb_target = self.encoder_target(history_flat)  # Both used (target now trainable)
 
         v_hat = emb_source[:, :3]
-        l_s = emb_source[:, 3:]  # 16D
-        l_t = emb_target[:, 3:]  # 16D
+        l_s = emb_source[:, 3:]
+        l_t = emb_target[:, 3:]
 
         true_vel = torch.cat([
             self._robot.data.root_lin_vel_b[:, :2],
@@ -163,12 +158,11 @@ class Go1Env(DirectRLEnv):
         loss_vel = self.vel_loss_fn(v_hat, true_vel)
         loss_swav = self.swav_loss(l_s, l_t, self.prototypes)
 
-        # Exact paper scales: 1.0 each
+        # Exact paper scales
         return {
             "loss_vel": loss_vel * 1.0,
             "loss_swav": loss_swav * 1.0
         }
-
 
     def _get_rewards(self) -> torch.Tensor:
         # === Same 11 rewards as before (only relevant parts shown) ===
@@ -220,6 +214,10 @@ class Go1Env(DirectRLEnv):
         ]):
             self._episode_sums[k] += v
 
+        # Add early termination for poor tracking (curriculum)
+        steps = self.episode_length_buf.float() + 1e-6  # avoid div0
+        poor_tracking = (self._episode_sums["tracking_lin_vel"] / steps) < 0.8
+
         if self._global_step % 500 == 0:
             env_idx = 0
             print(f"\nStep {self._global_step} | Height: {base_height[env_idx]:.3f}m | "
@@ -231,13 +229,23 @@ class Go1Env(DirectRLEnv):
         return total_reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        timeout = self.episode_length_buf >= self.max_episode_length - 1
         gravity = self._robot.data.projected_gravity_b
         roll_pitch = torch.sqrt(gravity[:, 0]**2 + gravity[:, 1]**2)
         base_height = self._robot.data.root_pos_w[:, 2]
+
         tipped = roll_pitch > 0.9
         too_low = base_height < 0.18
-        return tipped | too_low, timeout
+
+        # Curriculum: early termination if linear velocity tracking is poor
+        # Avoid division by zero on first step
+        steps = self.episode_length_buf.float() + 1e-6
+        tracking_reward_per_step = self._episode_sums["tracking_lin_vel"] / steps
+        poor_tracking = tracking_reward_per_step < 0.8  # 80% of max possible (max r_lin_vel = 1.0)
+
+        terminated = tipped | too_low | poor_tracking
+        truncated = self.episode_length_buf >= self.max_episode_length - 1
+
+        return terminated, truncated
 
     def _reset_idx(self, env_ids: torch.Tensor):
         if len(env_ids) == 0:

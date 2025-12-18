@@ -111,12 +111,12 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
     # Velocity commands - LIMITED for small dogs per HIMLoco issue #6
     commands = mdp.commands.UniformVelocityCommandCfg(
         asset_name="robot",
-        resampling_time_range=(10.0, 10.0),
+        resampling_time_range=(0.5, 0.5),  # Every ~25 policy steps — matches paper
         debug_vis=False,
         ranges=mdp.commands.UniformVelocityCommandCfg.Ranges(
-            lin_vel_x=(-1.5, 2.0),  # Limited to 2m/s max per HIMLoco
-            lin_vel_y=(-0.6, 0.6),
-            ang_vel_z=(-1.5, 1.5),
+            lin_vel_x=(-1.0, 1.0),  # Paper ranges
+            lin_vel_y=(-1.0, 1.0),
+            ang_vel_z=(-2.0, 2.0),
             heading=(-np.pi, np.pi),
         ),
     )
