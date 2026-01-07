@@ -60,9 +60,8 @@ class Go1SceneCfg(InteractiveSceneCfg):
         prim_path="/World/envs/env_.*/Robot",
         spawn=UNITREE_GO1_CFG.spawn.replace(activate_contact_sensors=True),
         init_state=UNITREE_GO1_CFG.init_state.replace(
-            pos=(0.0, 0.0, 0.42),  # Start higher to avoid initial ground contact
+            pos=(0.0, 0.0, 0.35),  # Optional: also lower here for consistency
             joint_pos={
-                # Better initial pose for standing
                 ".*_hip_joint": 0.1,
                 ".*_thigh_joint": 0.8,
                 ".*_calf_joint": -1.5,
@@ -71,18 +70,18 @@ class Go1SceneCfg(InteractiveSceneCfg):
         actuators={
             "legs": ImplicitActuatorCfg(
                 joint_names_expr=[".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"],
-                stiffness=20.0,  # legged_gym Go1 default
-                damping=0.5,  # legged_gym Go1 default
-                effort_limit=23.5,  # Go1 spec (not 33.5)
+                stiffness=10.0,   # Lowered from 20.0 — allows sag/drop faster
+                damping=0.2,      # Lowered from 0.5 — less resistance
+                effort_limit=23.5,
             ),
         },
     )
 
     contact_sensor = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/.*",
-        update_period=0.0,
-        history_length=3,
-        debug_vis=False,
+        prim_path="{ENV_REGEX_NS}/Robot/.*_foot",  # Only feet
+        update_period=0.005,
+        history_length=1,
+        debug_vis=True,
         track_air_time=True,
     )
 
@@ -93,10 +92,10 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
 
     # Episode settings
     episode_length_s = 20.0
-    decimation = 4  # 50Hz policy
+    decimation = 8  # Updated: 400 Hz physics / 8 = 50 Hz policy
 
     # Environment settings
-    num_envs = 4096
+    num_envs = 1000 #40#96
     env_spacing = 3.0
 
     # HIMLoco history
@@ -111,20 +110,32 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
     # Velocity commands - LIMITED for small dogs per HIMLoco issue #6
     commands = mdp.commands.UniformVelocityCommandCfg(
         asset_name="robot",
-        resampling_time_range=(0.5, 0.5),  # Every ~25 policy steps — matches paper
+        resampling_time_range=(0.5, 0.5),
         debug_vis=False,
         ranges=mdp.commands.UniformVelocityCommandCfg.Ranges(
-            lin_vel_x=(-1.0, 1.0),  # Paper ranges
-            lin_vel_y=(-1.0, 1.0),
-            ang_vel_z=(-2.0, 2.0),
+            # lin_vel_x=(0.2, 1.5),  # Bias toward positive (forward)
+            # lin_vel_y=(-0.6, 0.6),
+            # lin_vel_x=(0.3, 1.5),  # Bias strongly forward (was -1.0 to 1.0)
+            lin_vel_x=(0.5, 2.0),
+            lin_vel_y=(-0.3, 0.3),  # Reduce lateral
+            ang_vel_z=(-1.5, 1.5),
             heading=(-np.pi, np.pi),
         ),
+
+        # ranges=mdp.commands.UniformVelocityCommandCfg.Ranges(
+        #     lin_vel_x=(-1.0, 1.0),
+        #     lin_vel_y=(-1.0, 1.0),
+        #     ang_vel_z=(-2.0, 2.0),
+        #     heading=(-3.141592653589793, 3.141592653589793),  # Full -π to π range
+        # ),
+        heading_command=True,  # <-- Add this line to enable heading command
     )
 
     # Simulation
     sim: SimulationCfg = SimulationCfg(
-        dt=1.0 / 200.0,
-        render_interval=decimation,
+        dt=1.0 / 200.0,  # 400 Hz physics for more stability
+        render_interval=decimation,  # Render every policy step
+        gravity=(0.0, 0.0, -9.81),
         physics_material=sim_utils.RigidBodyMaterialCfg(
             static_friction=1.0,
             dynamic_friction=1.0,

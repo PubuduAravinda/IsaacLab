@@ -47,12 +47,12 @@ class Go1Env(DirectRLEnv):
         super().__init__(cfg, render_mode, **kwargs)
 
         print("\n" + "="*80)
-        print("HIMLoco Replication — Ready for RSL_RL (Aux losses active, with shifted views and momentum)")
+        print("HIMLoco Replication — Ready for RSL_RL (Aux losses active, target unfrozen)")
         print("="*80 + "\n")
 
         self.command_manager = UniformVelocityCommand(cfg=self.cfg.commands, env=self)
 
-        # HIM Encoders
+        # HIM Encoders (both trainable — unfrozen target for aux optimization)
         def make_encoder():
             return nn.Sequential(
                 nn.Linear(45 * 5, 512), nn.ReLU(),
@@ -61,8 +61,8 @@ class Go1Env(DirectRLEnv):
                 nn.Linear(128, 19)
             ).to(self.device)
 
-        self.encoder_source = make_encoder()  # Online, trainable
-        self.encoder_target = make_encoder()  # Momentum copy
+        self.encoder_source = make_encoder()
+        self.encoder_target = make_encoder()  # UNFROZEN — will be updated via aux losses in RSL_RL
 
         self.prototypes = nn.Parameter(torch.randn(16, 16))
         nn.init.normal_(self.prototypes, std=0.01)
@@ -75,7 +75,7 @@ class Go1Env(DirectRLEnv):
         self._previous_actions = torch.zeros_like(self._actions)
         self._prev_prev_actions = torch.zeros_like(self._actions)
         self._target_positions = torch.zeros(self.num_envs, 12, device=self.device)
-        self.obs_history = torch.zeros(self.num_envs, 5, 45, device=self.device)  # H=5
+        self.obs_history = torch.zeros(self.num_envs, 6, 45, device=self.device)  # H=5 +1 for shift
 
         self._episode_sums = {k: torch.zeros(self.num_envs, device=self.device) for k in [
             "tracking_lin_vel", "tracking_ang_vel", "lin_vel_z", "ang_vel_xy",
@@ -87,12 +87,10 @@ class Go1Env(DirectRLEnv):
 
         # Foot indices for clearance reward
         foot_names = ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
-        self.foot_indices = torch.tensor(
-            [self._robot.find_bodies(name)[0] for name in foot_names],
-            device=self.device, dtype=torch.long
-        )
-
-        self.momentum = 0.99  # For EMA update
+        # self.foot_indices = torch.tensor(
+        #     [self._robot.find_bodies(name)[0] for name in foot_names],
+        #     device=self.device, dtype=torch.long
+        # )
 
     def _setup_scene(self):
         self._robot = self.scene["robot"]
@@ -124,16 +122,34 @@ class Go1Env(DirectRLEnv):
         self.obs_history = torch.roll(self.obs_history, shifts=-1, dims=1)
         self.obs_history[:, -1] = base_obs
 
-        history_flat = self.obs_history.reshape(self.num_envs, -1)
+        history_flat = self.obs_history[:, -5:].reshape(self.num_envs, -1)
 
         emb_source = self.encoder_source(history_flat)
 
         policy_obs = torch.cat([base_obs, emb_source], dim=1)  # 64D
 
-        if self._global_step % 1000 == 0:
-            v = emb_source[0, :3].detach().cpu().numpy()
-            l_norm = emb_source[0, 3:].detach().norm().item()
-            print(f"\nHIM | Step {self._global_step} | v_hat: {v} | l_norm: {l_norm:.3f}")
+        # Add this line to define base_height
+        base_height = self._robot.data.root_pos_w[:, 2]
+
+        if self._global_step % 100 == 0:
+            contact_sensor = self.scene.sensors.get("contact_sensor", None)
+            if contact_sensor is None:
+                print("Warning: contact_sensor not found!")
+                mean_force_z = 0.0
+            else:
+                net_forces = contact_sensor.data.net_forces_w
+                if net_forces is None or net_forces.numel() == 0:
+                    mean_force_z = 0.0
+                else:
+                    # Sensor is only on 4 feet → all bodies are feet → use all
+                    foot_net_z = net_forces[:, :, 2]  # (num_envs, 4) Z forces
+                    mean_force_z = foot_net_z.abs().mean().item()
+
+            print(f"=============>>>> Step {self._global_step} | Mean foot Z force: {mean_force_z:.2f} N")
+
+            mean_vel_x = self._robot.data.root_lin_vel_b[:, 0].mean().item()
+            print(f"Step {self._global_step} | Mean forward vel: {mean_vel_x:.2f} m/s")
+
 
         self._global_step += 1
         return {"policy": policy_obs, "critic": policy_obs}
@@ -142,14 +158,9 @@ class Go1Env(DirectRLEnv):
         if not self.training:
             return {}
 
-        # Shifted views for predictive contrastive
-        source_history = self.obs_history[:, :-1].reshape(self.num_envs, -1)  # t-5:t-1 (4*45=180? Wait, paper H=5, but to shift, use full H for source, roll for target
-        # To match dimension, use full H for both, but target is rolled forward (but since history is rolling, approximate shift by using current history for source, rolled for target
-        # For exact, we'd need H+1, but to keep simple, use the same, but it's not shifted. To fix, make history 6, source [:, :5], target [:, 1:6]
-        # Update: Assume you updated history to (num_envs, 6, 45) in init, and roll/add as before.
-        # Then:
-        source_history = self.obs_history[:, :5].reshape(self.num_envs, -1)  # t-5:t-1
-        target_history = self.obs_history[:, 1:6].reshape(self.num_envs, -1)  # t-4:t (shifted forward)
+        # Shifted views
+        source_history = self.obs_history[:, :-1].reshape(self.num_envs, -1)  # Last 5 for source
+        target_history = self.obs_history[:, 1:].reshape(self.num_envs, -1)  # Shifted 5 for target
 
         emb_source = self.encoder_source(source_history)
         emb_target = self.encoder_target(target_history)
@@ -165,9 +176,6 @@ class Go1Env(DirectRLEnv):
 
         loss_vel = self.vel_loss_fn(v_hat, true_vel)
         loss_swav = self.swav_loss(l_s, l_t, self.prototypes)
-
-        # After aux backward in RSL_RL, add momentum update (but since no custom, note it's not here; to add, need custom runner)
-        # For now, approximate by doing EMA here, but since no grad step, it's not effective. See below for full fix.
 
         return {
             "loss_vel": loss_vel * 1.0,
@@ -228,13 +236,6 @@ class Go1Env(DirectRLEnv):
         steps = self.episode_length_buf.float() + 1e-6  # avoid div0
         poor_tracking = (self._episode_sums["tracking_lin_vel"] / steps) < 0.8
 
-        if self._global_step % 500 == 0:
-            env_idx = 0
-            print(f"\nStep {self._global_step} | Height: {base_height[env_idx]:.3f}m | "
-                  f"Vel: [{base_lin_vel[env_idx,0]:.2f}, {base_lin_vel[env_idx,1]:.2f}] | "
-                  f"Cmd: [{commands[env_idx,0]:.2f}, {commands[env_idx,1]:.2f}] | "
-                  f"Rew: {total_reward[env_idx]:.3f}\n")
-
         self._global_step += 1
         return total_reward
 
@@ -246,36 +247,58 @@ class Go1Env(DirectRLEnv):
         tipped = roll_pitch > 0.9
         too_low = base_height < 0.18
 
-        # Curriculum: early termination if linear velocity tracking is poor
-        # Avoid division by zero on first step
-        steps = self.episode_length_buf.float() + 1e-6
-        tracking_reward_per_step = self._episode_sums["tracking_lin_vel"] / steps
-        poor_tracking = tracking_reward_per_step < 0.8  # 80% of max possible (max r_lin_vel = 1.0)
+        # Temporarily disable poor_tracking to allow longer episodes and contact learning
+        poor_tracking = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # Optional: re-enable after some steps
+        # if self._global_step > 200000:
+        #     steps = self.episode_length_buf.float() + 1e-6
+        #     poor_tracking = (self._episode_sums["tracking_lin_vel"] / steps) < 0.5
 
         terminated = tipped | too_low | poor_tracking
         truncated = self.episode_length_buf >= self.max_episode_length - 1
+
+        if self._global_step % 10 == 0:
+            print(f"Step {self._global_step} | Tipped: {tipped.mean().item():.2f} | Too low: {too_low.mean().item():.2f} | Poor tracking: {poor_tracking.mean().item():.2f}")
 
         return terminated, truncated
 
     def _reset_idx(self, env_ids: torch.Tensor):
         if len(env_ids) == 0:
             return
+
         super()._reset_idx(env_ids)
+
         self.command_manager.reset(env_ids)
+
+        # Zero buffers
         self.obs_history[env_ids] = 0.0
         self._actions[env_ids] = 0.0
         self._previous_actions[env_ids] = 0.0
         self._prev_prev_actions[env_ids] = 0.0
         self._target_positions[env_ids] = self._robot.data.default_joint_pos[env_ids]
 
-        joint_pos = self._robot.data.default_joint_pos[env_ids]
+        # Reset episode sums
+        for k in self._episode_sums:
+            self._episode_sums[k][env_ids] = 0.0
+
+        # Initial joint state with small randomization
+        joint_pos = self._robot.data.default_joint_pos[env_ids].clone()
         joint_vel = torch.zeros_like(joint_pos)
+        joint_pos += (torch.rand_like(joint_pos) - 0.5) * 0.2  # ±0.1 rad noise
+
+        # Root state
         root_state = self._robot.data.default_root_state[env_ids].clone()
         root_state[:, :3] += self.scene.env_origins[env_ids]
-        root_state[:, 2] = 0.42
+
+        # Lower spawn height + randomization
+        root_state[:, 2] = 0.25 + torch.rand(len(env_ids), device=self.device) * 0.05  # 0.25–0.30m
+
+        # Add downward velocity to force quick drop
+        root_state[:, 10] = -0.5 + torch.rand(len(env_ids), device=self.device) * -0.5  # -0.5 to -1.0 m/s (Z velocity)
+
+        # print(f"Reset env_ids {env_ids[0]} | Spawn height: {root_state[0, 2]:.3f}m")
+
+        # Write to sim
         self._robot.write_root_pose_to_sim(root_state[:, :7], env_ids)
         self._robot.write_root_velocity_to_sim(root_state[:, 7:], env_ids)
         self._robot.write_joint_state_to_sim(joint_pos, joint_vel, None, env_ids)
-
-        for k in self._episode_sums:
-            self._episode_sums[k][env_ids] = 0.0
