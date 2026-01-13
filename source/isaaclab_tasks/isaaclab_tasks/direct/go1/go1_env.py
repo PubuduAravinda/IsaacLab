@@ -80,17 +80,26 @@ class Go1Env(DirectRLEnv):
         self._episode_sums = {k: torch.zeros(self.num_envs, device=self.device) for k in [
             "tracking_lin_vel", "tracking_ang_vel", "lin_vel_z", "ang_vel_xy",
             "orientation", "joint_acc", "joint_power", "base_height",
-            "foot_clearance", "action_rate", "smoothness"
+            "foot_clearance", "action_rate", "smoothness", "r_lateral_vel", "r_alive", "r_no_movement"
         ]}
 
         self._global_step = 0
 
-        # Foot indices for clearance reward
-        foot_names = ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
-        # self.foot_indices = torch.tensor(
-        #     [self._robot.find_bodies(name)[0] for name in foot_names],
-        #     device=self.device, dtype=torch.long
-        # )
+        # Cache foot indices safely
+        self.foot_names = ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
+
+        foot_indices_list = []
+        for name in self.foot_names:
+            body_indices, matched_names = self._robot.find_bodies(name)
+            if len(body_indices) == 0:
+                raise RuntimeError(f"Foot body '{name}' not found! Available bodies: {self._robot.body_names}")
+            foot_indices_list.append(body_indices[0])  # body_indices[0] is an int
+
+        self.foot_indices = torch.tensor(foot_indices_list, device=self.device, dtype=torch.long)
+
+        # Debug: Print to confirm valid indices (e.g., tensor([13,14,15,16]))
+        print("Cached foot indices:", self.foot_indices)
+
 
     def _setup_scene(self):
         self._robot = self.scene["robot"]
@@ -183,21 +192,24 @@ class Go1Env(DirectRLEnv):
         }
 
     def _get_rewards(self) -> torch.Tensor:
-        # === Same 11 rewards as before (only relevant parts shown) ===
-        base_lin_vel = self._robot.data.root_lin_vel_b
-        base_ang_vel = self._robot.data.root_ang_vel_b
-        base_height = self._robot.data.root_pos_w[:, 2]
-        projected_gravity = self._robot.data.projected_gravity_b
-        dof_acc = self._robot.data.joint_acc
-        dof_pos = self._robot.data.joint_pos
-        dof_vel = self._robot.data.joint_vel
+        # Base states
+        base_lin_vel = self._robot.data.root_lin_vel_b  # (num_envs, 3)
+        base_ang_vel = self._robot.data.root_ang_vel_b  # (num_envs, 3)
+        base_height = self._robot.data.root_pos_w[:, 2]  # (num_envs,)
+        projected_gravity = self._robot.data.projected_gravity_b  # (num_envs, 3)
 
+        # Joint states
+        dof_acc = self._robot.data.joint_acc  # (num_envs, 12)
+        dof_pos = self._robot.data.joint_pos  # (num_envs, 12)
+        dof_vel = self._robot.data.joint_vel  # (num_envs, 12)
+
+        # Commands
         try:
             commands = self.command_manager.get_command("__default__")
         except:
-            commands = self.command_manager.command
+            commands = self.command_manager.command  # (num_envs, 4): vx, vy, vz_cmd (unused), yaw_rate
 
-        # Torque approximation (PD)
+        # Approximate torque via PD control (for power reward)
         actuator_cfg = self._robot.cfg.actuators["legs"]
         stiffness = torch.full((self.num_envs, 12), actuator_cfg.stiffness, device=self.device)
         damping = torch.full((self.num_envs, 12), actuator_cfg.damping, device=self.device)
@@ -206,59 +218,70 @@ class Go1Env(DirectRLEnv):
 
         sigma = 0.25
 
-        # 11 rewards exactly as paper
-        r_lin_vel = torch.exp(-torch.sum((base_lin_vel[:, :2] - commands[:, :2])**2, dim=1) / (2 * sigma**2)) * 1.0
-        r_ang_vel = torch.exp(-(base_ang_vel[:, 2] - commands[:, 2])**2 / sigma) * 0.5
-        r_lin_vel_z = -(base_lin_vel[:, 2]**2) * 2.0
-        r_ang_vel_xy = -(torch.sum(base_ang_vel[:, :2]**2, dim=1) / 2) * 0.05
-        r_orientation = -(torch.sum(projected_gravity[:, :2]**2, dim=1) / 2) * 0.2
-        r_joint_acc = -torch.sum(dof_acc**2, dim=1) * 2.5e-7
-        r_joint_power = -torch.sum(torch.abs(dof_torque_approx) * torch.abs(dof_vel), dim=1) * 2e-5
-        r_base_height = -((base_height - 0.40)**2) * 1.0
-        # Note: foot_clearance removed or set to 0 since no contacts in obs
+        # === Individual rewards (exactly as in HIMLoco paper) ===
+        r_lin_vel = torch.exp(-torch.sum((base_lin_vel[:, :2] - commands[:, :2]) ** 2, dim=1) / (2 * sigma ** 2)) * 10.0  # *8.0 (was 2.0) — huge incentive
+        r_ang_vel = torch.exp(-(base_ang_vel[:, 2] - commands[:, 2]) ** 2 / sigma) * 1.0  # keep your fix
+        # r_ang_vel = torch.exp(-(base_ang_vel[:, 2] - commands[:, 2]) ** 2 / (sigma ** 2)) * 2.0
+
+        r_lin_vel_z = - (base_lin_vel[:, 2] ** 2) * 2.0
+        r_ang_vel_xy = - (torch.sum(base_ang_vel[:, :2] ** 2, dim=1)) * 0.05
+        r_orientation = - (torch.sum(projected_gravity[:, :2] ** 2, dim=1)) * 0.2
+        r_joint_acc = - torch.sum(dof_acc ** 2, dim=1) * 2.5e-7
+        r_joint_power = - torch.sum(torch.abs(dof_torque_approx) * torch.abs(dof_vel), dim=1) * 2e-5
+        r_base_height = - ((base_height - 0.34) ** 2) * 1.0
+
+        r_lateral_vel = - (base_lin_vel[:, 1] ** 2) * 1.5  # Penalize abs(lateral vel); scale 0.5–1.0
+        r_alive = torch.ones(self.num_envs, device=self.device) * 3.0  # +3 per step alive — strongly encourages long episodes
+        # After computing base_lin_vel
+        vel_norm_xy = torch.norm(base_lin_vel[:, :2], dim=1)  # forward + lateral speed
+        r_no_movement = -3.0 * (vel_norm_xy < 0.3).float()  # -3 if speed < 0.3 m/s
+        # or more aggressive: -5.0 * torch.relu(0.4 - vel_norm_xy)  # linear penalty below 0.4 m/s
+
+        # Temporarily disable foot clearance to avoid body indexing issues
         r_foot_clearance = torch.zeros(self.num_envs, device=self.device)
-        r_action_rate = -(torch.sum((self._actions - self._previous_actions)**2, dim=1) / 2) * 0.01
-        r_smoothness = -(torch.sum((self._actions - 2*self._previous_actions + self._prev_prev_actions)**2, dim=1) / 2) * 0.01
 
-        total_reward = (r_lin_vel + r_ang_vel + r_lin_vel_z + r_ang_vel_xy +
-                        r_orientation + r_joint_acc + r_joint_power + r_base_height +
-                        r_foot_clearance + r_action_rate + r_smoothness)
+        r_action_rate = - torch.sum((self._actions - self._previous_actions) ** 2, dim=1) * 0.005
+        r_smoothness = - torch.sum((self._actions - 2 * self._previous_actions + self._prev_prev_actions) ** 2, dim=1) * 0.005
 
-        # Accumulate
-        for k, v in zip(self._episode_sums.keys(), [
+        # === Total reward ===
+        total_reward = (
+                r_lin_vel + r_ang_vel + r_lin_vel_z + r_ang_vel_xy +
+                r_orientation + r_joint_acc + r_joint_power + r_base_height +
+                r_foot_clearance + r_action_rate + r_smoothness + r_lateral_vel + r_alive + r_no_movement
+        )
+
+        # === Accumulate per-episode sums for curriculum / logging ===
+        reward_terms = [
             r_lin_vel, r_ang_vel, r_lin_vel_z, r_ang_vel_xy,
             r_orientation, r_joint_acc, r_joint_power, r_base_height,
-            r_foot_clearance, r_action_rate, r_smoothness
-        ]):
-            self._episode_sums[k] += v
-
-        # Add early termination for poor tracking (curriculum)
-        steps = self.episode_length_buf.float() + 1e-6  # avoid div0
-        poor_tracking = (self._episode_sums["tracking_lin_vel"] / steps) < 0.8
+            r_foot_clearance, r_action_rate, r_smoothness + r_lateral_vel + r_alive + r_no_movement
+        ]
+        for key, value in zip(self._episode_sums.keys(), reward_terms):
+            self._episode_sums[key] += value
 
         self._global_step += 1
         return total_reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         gravity = self._robot.data.projected_gravity_b
-        roll_pitch = torch.sqrt(gravity[:, 0]**2 + gravity[:, 1]**2)
+        roll_pitch = torch.sqrt(gravity[:, 0] ** 2 + gravity[:, 1] ** 2)
         base_height = self._robot.data.root_pos_w[:, 2]
 
-        tipped = roll_pitch > 0.9
-        too_low = base_height < 0.18
+        tipped = roll_pitch > 1.2  # was 0.9 → more tolerant
+        too_low = base_height < 0.10  # was 0.18 → give more room
 
-        # Temporarily disable poor_tracking to allow longer episodes and contact learning
         poor_tracking = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        # Optional: re-enable after some steps
-        # if self._global_step > 200000:
-        #     steps = self.episode_length_buf.float() + 1e-6
-        #     poor_tracking = (self._episode_sums["tracking_lin_vel"] / steps) < 0.5
+        if self._global_step > 500000:
+            steps = self.episode_length_buf.float() + 1e-6
+            poor_tracking = (self._episode_sums[
+                                 "tracking_lin_vel"] / steps) < 0.8  # Enabled with paper threshold 0.8 (was 0.5)
 
         terminated = tipped | too_low | poor_tracking
         truncated = self.episode_length_buf >= self.max_episode_length - 1
 
         if self._global_step % 10 == 0:
-            print(f"Step {self._global_step} | Tipped: {tipped.mean().item():.2f} | Too low: {too_low.mean().item():.2f} | Poor tracking: {poor_tracking.mean().item():.2f}")
+            print(
+                f"Step {self._global_step} | Tipped: {tipped.mean().item():.2f} | Too low: {too_low.mean().item():.2f} | Poor tracking: {poor_tracking.mean().item():.2f}")
 
         return terminated, truncated
 
@@ -291,7 +314,8 @@ class Go1Env(DirectRLEnv):
         root_state[:, :3] += self.scene.env_origins[env_ids]
 
         # Lower spawn height + randomization
-        root_state[:, 2] = 0.25 + torch.rand(len(env_ids), device=self.device) * 0.05  # 0.25–0.30m
+        # root_state[:, 2] = 0.25 + torch.rand(len(env_ids), device=self.device) * 0.05  # 0.25–0.30m
+        root_state[:, 2] = 0.35
 
         # Add downward velocity to force quick drop
         root_state[:, 10] = -0.5 + torch.rand(len(env_ids), device=self.device) * -0.5  # -0.5 to -1.0 m/s (Z velocity)

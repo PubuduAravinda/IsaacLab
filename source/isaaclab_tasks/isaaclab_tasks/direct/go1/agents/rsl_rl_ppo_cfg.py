@@ -18,7 +18,7 @@ class Go1RslRlPpoCfg(RslRlOnPolicyRunnerCfg):
 
     num_steps_per_env = 100                # Critical: ~2s rollout, matches paper
     max_iterations = 10000                 # Long training (adjust as needed)
-    save_interval = 500                    # Save every 500 updates
+    save_interval = 100 #500                    # Save every 500 updates
     experiment_name = "go1_himloco"
     run_name = ""                          # Optional suffix
     empirical_normalization = False        # No running stats on obs (paper uses raw)
@@ -35,10 +35,10 @@ class Go1RslRlPpoCfg(RslRlOnPolicyRunnerCfg):
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.01,                   # Paper value — better exploration
+        entropy_coef=0.02,                  # Paper value — better exploration
         num_learning_epochs=5,
         num_mini_batches=4,                  # Good balance with large env count
-        learning_rate=1.0e-3,
+        learning_rate=1.0e-4,
         schedule="adaptive",
         gamma=0.99,
         lam=0.95,
