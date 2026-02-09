@@ -80,7 +80,7 @@ class Go1Env(DirectRLEnv):
         self._episode_sums = {k: torch.zeros(self.num_envs, device=self.device) for k in [
             "tracking_lin_vel", "tracking_ang_vel", "lin_vel_z", "ang_vel_xy",
             "orientation", "joint_acc", "joint_power", "base_height",
-            "foot_clearance", "action_rate", "smoothness", "r_lateral_vel", "r_alive", "r_no_movement"
+            "foot_clearance", "action_rate", "smoothness", "r_lateral_vel", "r_alive", "r_no_movement", "r_backward_penalty"
         ]}
 
         self._global_step = 0
@@ -100,17 +100,125 @@ class Go1Env(DirectRLEnv):
         # Debug: Print to confirm valid indices (e.g., tensor([13,14,15,16]))
         print("Cached foot indices:", self.foot_indices)
 
+        print("Joint names and indices (from robot data):")
+        for i, name in enumerate(self._robot.joint_names):
+            print(f"  {i:2d}: {name}")
+
+        # For debug prints
+        self.debug_joint_history = []   # list of (joint_delta, action) tuples
+        self.debug_obs_stats = {"min": [], "max": [], "mean": [], "std": []}
 
     def _setup_scene(self):
         self._robot = self.scene["robot"]
 
+    # def _pre_physics_step(self, actions: torch.Tensor):
+    #     # Per-joint-group hard clamping — prevents extremes while allowing expressive range
+    #     # Order: FL/FR/RL/RR hip → FL/FR/RL/RR thigh → FL/FR/RL/RR calf
+    #     # Hips:   ±0.8 rad (abduction/adduction — limited by mechanics)
+    #     # Thighs: ±1.2 rad (hip flexion/extension — more range)
+    #     # Calves: ±1.6 rad (knee flexion/extension — largest needed for propulsion)
+    #
+    #     clamped_actions = actions.clone()
+    #
+    #     # Hips (indices 0–3)
+    #     clamped_actions[:, 0:4] = torch.clamp(clamped_actions[:, 0:4], -0.8, 0.8)
+    #
+    #     # Thighs (indices 4–7)
+    #     clamped_actions[:, 4:8] = torch.clamp(clamped_actions[:, 4:8], -1.2, 1.2)
+    #
+    #     # Calves (indices 8–11)
+    #     clamped_actions[:, 8:12] = torch.clamp(clamped_actions[:, 8:12], -1.6, 1.6)
+    #
+    #     # Optional: small smoothing / momentum (uncomment if jerky)
+    #     # clamped_actions = 0.85 * clamped_actions + 0.15 * self._previous_actions
+    #
+    #     # History shift
+    #     self._prev_prev_actions = self._previous_actions.clone()
+    #     self._previous_actions = self._actions.clone()
+    #     self._actions = clamped_actions.clone()
+    #
+    #     # Targets: direct delta from default (your successful style)
+    #     self._target_positions = clamped_actions + self._robot.data.default_joint_pos
+    #
+
+    # def _pre_physics_step(self, actions: torch.Tensor):
+    #     """
+    #     Curriculum on per-group clamp ranges based on mean episode reward
+    #     """
+    #     # Compute mean episode reward (total sum across all terms, averaged over envs)
+    #     total_reward_sum = torch.zeros(self.num_envs, device=self.device)
+    #     for key in self._episode_sums:
+    #         total_reward_sum += self._episode_sums[key]
+    #
+    #     mean_reward_per_env = total_reward_sum / len(self._episode_sums) if len(
+    #         self._episode_sums) > 0 else torch.zeros(self.num_envs, device=self.device)
+    #     mean_episode_reward = mean_reward_per_env.mean().item()
+    #
+    #     # Thresholds (tune these!)
+    #     start_ramp_reward = 15.0
+    #     full_ramp_reward = 30.0
+    #
+    #     ramp_progress = 0.0
+    #     if mean_episode_reward > start_ramp_reward:
+    #         ramp_progress = min(1.0, (mean_episode_reward - start_ramp_reward) / (full_ramp_reward - start_ramp_reward))
+    #
+    #     hip_max = 0.8
+    #     thigh_max = 0.8 + ramp_progress * (1.2 - 0.8)
+    #     calf_max = 0.8 + ramp_progress * (1.6 - 0.8)
+    #
+    #     if ramp_progress < 1e-3:
+    #         mode = "uniform ±0.8 (stable)"
+    #     elif ramp_progress < 1.0:
+    #         mode = f"ramping (progress {ramp_progress:.2f})"
+    #     else:
+    #         mode = "full per-group (±0.8/1.2/1.6)"
+    #
+    #     # ALWAYS PRINT EVERY 50 STEPS — no conditions
+    #     if self._global_step % 150 == 0 and self._global_step > 0:
+    #         print(f"[CURRICULUM] Step {self._global_step:>8d} | "
+    #               f"Mean reward: {mean_episode_reward:+.1f} | "
+    #               f"Ramp progress: {ramp_progress:.2f} | "
+    #               f"Ranges: hip±{hip_max:.2f} thigh±{thigh_max:.2f} calf±{calf_max:.2f} | "
+    #               f"Mode: {mode}")
+    #         import sys
+    #         sys.stdout.flush()  # force output now
+    #
+    #     # Apply clamping
+    #     clamped_actions = actions.clone()
+    #     clamped_actions[:, 0:4] = torch.clamp(clamped_actions[:, 0:4], -hip_max, hip_max)
+    #     clamped_actions[:, 4:8] = torch.clamp(clamped_actions[:, 4:8], -thigh_max, thigh_max)
+    #     clamped_actions[:, 8:12] = torch.clamp(clamped_actions[:, 8:12], -calf_max, calf_max)
+    #
+    #     # Smoothing during transition
+    #     actions_smoothed = clamped_actions #0.92 * clamped_actions + 0.08 * self._previous_actions
+    #
+    #     # History + targets
+    #     self._prev_prev_actions = self._previous_actions.clone()
+    #     self._previous_actions = self._actions.clone()
+    #     self._actions = actions_smoothed.clone()
+    #     self._target_positions = actions_smoothed + self._robot.data.default_joint_pos
+
+
     def _pre_physics_step(self, actions: torch.Tensor):
-        actions = torch.clamp(actions, -1.0, 1.0)
+        actions = torch.clamp(actions, -1.6, 1.6)
         self._prev_prev_actions = self._previous_actions.clone()
         self._previous_actions = self._actions.clone()
         self._actions = actions.clone()
 
         self._target_positions = self.cfg.action_scale * actions + self._robot.data.default_joint_pos
+
+
+    # def _pre_physics_step(self, actions: torch.Tensor):
+    #
+    #     self.action_scales = torch.tensor([1.0] * 12, device=self.device)  # Mid: uniform medium
+    #     actions_scaled = self.action_scales * torch.tanh(actions)
+    #
+    #     #actions = torch.clamp(actions, -1.0, 1.0)
+    #     self._prev_prev_actions = self._previous_actions.clone()
+    #     self._previous_actions = self._actions.clone()
+    #     self._actions = actions_scaled.clone()
+    #
+    #     self._target_positions = actions_scaled + self._robot.data.default_joint_pos
 
     def _apply_action(self):
         self._robot.set_joint_position_target(self._target_positions)
@@ -140,7 +248,23 @@ class Go1Env(DirectRLEnv):
         # Add this line to define base_height
         base_height = self._robot.data.root_pos_w[:, 2]
 
-        if self._global_step % 100 == 0:
+
+
+        # ── Collect stats for sim2real matching ───────────────────────
+        self.debug_obs_stats["min"].append(policy_obs.min(dim=0).values)
+        self.debug_obs_stats["max"].append(policy_obs.max(dim=0).values)
+        self.debug_obs_stats["mean"].append(policy_obs.mean(dim=0))
+        self.debug_obs_stats["std"].append(policy_obs.std(dim=0))
+
+        if len(self.debug_obs_stats["min"]) > 200:
+            for k in self.debug_obs_stats:
+                self.debug_obs_stats[k].pop(0)
+
+        # ── Detailed debug print every 100 steps ──────────────────────
+        if self._global_step % 100 == 0 and self._global_step > 0:
+            print("\n" + "="*100)
+            print(f"Global step: {self._global_step:>8d} | Mean forward vel: {self._robot.data.root_lin_vel_b[:,0].mean().item():.3f} m/s")
+
             contact_sensor = self.scene.sensors.get("contact_sensor", None)
             if contact_sensor is None:
                 print("Warning: contact_sensor not found!")
@@ -155,9 +279,58 @@ class Go1Env(DirectRLEnv):
                     mean_force_z = foot_net_z.abs().mean().item()
 
             print(f"=============>>>> Step {self._global_step} | Mean foot Z force: {mean_force_z:.2f} N")
+            # Debug: Joint order, default, current pos, action, next (target) state, error (env 0 only)
+            joint_names = self._robot.joint_names
+            default_pos = self._robot.data.default_joint_pos[0]
+            current_pos = self._robot.data.joint_pos[0]
+            action_pos = self._actions[0]  # final clamped actions
+            target_pos = self._target_positions[0]  # default + action
+            error = target_pos - current_pos
 
-            mean_vel_x = self._robot.data.root_lin_vel_b[:, 0].mean().item()
-            print(f"Step {self._global_step} | Mean forward vel: {mean_vel_x:.2f} m/s")
+            print(f"Avg base height: {base_height.mean().item():.3f} m (std {base_height.std().item():.3f})")
+
+            print("Joint order, default/current pos, policy action, next state (target), error (env 0):")
+            print("  idx | name            | default | current | action  | next    | error   ")
+            for i, name in enumerate(joint_names):
+                print(f"  {i:3d} | {name:15} | {default_pos[i]:+6.3f} | {current_pos[i]:+6.3f} | {action_pos[i]:+6.3f} | {target_pos[i]:+6.3f} | {error[i]:+6.3f}")
+
+            # Last 5 raw cycles (joint_delta | action)
+            print("Last 5 raw cycles (joint_delta | action):")
+            for i, (jdelta, act) in enumerate(self.debug_joint_history[-5:]):
+                jstr = " ".join([f"{x:+.3f}" for x in jdelta[0]])
+                astr = " ".join([f"{x:+.3f}" for x in act[0]])
+                print(f"  t-{4-i:1d} jdelta: {jstr}")
+                print(f"        action: {astr}")
+
+            # Current state (env 0)
+            cmd = commands[0]
+            grav = self._robot.data.projected_gravity_b[0]
+            linvel = self._robot.data.root_lin_vel_b[0]
+            print("Current state (env 0):")
+            print(f"  command: vx = {cmd[0]:+5.3f} vy = {cmd[1]:+5.3f} yaw_rate = {cmd[2]:+5.3f}")
+            print(f"  gravity: x = {grav[0]:+5.3f} y = {grav[1]:+5.3f} z = {grav[2]:+5.3f}")
+            print(f"  lin_vel_b: x = {linvel[0]:+5.3f} y = {linvel[1]:+5.3f} z = {linvel[2]:+5.3f}")
+
+            # Observation statistics (64D)
+            if len(self.debug_obs_stats["min"]) > 0:
+                obs_min  = torch.stack(self.debug_obs_stats["min"]).min(dim=0).values
+                obs_max  = torch.stack(self.debug_obs_stats["max"]).max(dim=0).values
+                obs_mean = torch.stack(self.debug_obs_stats["mean"]).mean(dim=0)
+                obs_std  = torch.stack(self.debug_obs_stats["std"]).mean(dim=0)
+
+                print("\nPolicy observation stats (last ~200 env steps):")
+                print(" idx | min max mean std")
+                for i in range(0, 64, 8):
+                    print(f"  {i:2d}-{i+7:2d} | {obs_min[i]:+6.2f} {obs_max[i]:+6.2f} {obs_mean[i]:+6.2f} {obs_std[i]:5.3f}")
+
+            # Foot contact forces (if sensor exists)
+            if hasattr(self.scene.sensors, "contact_sensor"):
+                contact_sensor = self.scene.sensors["contact_sensor"]
+                if contact_sensor.data.net_forces_w is not None:
+                    foot_z = contact_sensor.data.net_forces_w[:, self.foot_indices, 2]
+                    print(f"Mean | max foot Z-force: {foot_z.abs().mean().item():.2f} | {foot_z.abs().max().item():.2f} N")
+
+            print("="*100 + "\n")
 
 
         self._global_step += 1
@@ -231,7 +404,7 @@ class Go1Env(DirectRLEnv):
         r_base_height = - ((base_height - 0.34) ** 2) * 1.0
 
         r_lateral_vel = - (base_lin_vel[:, 1] ** 2) * 1.5  # Penalize abs(lateral vel); scale 0.5–1.0
-        r_alive = torch.ones(self.num_envs, device=self.device) * 3.0  # +3 per step alive — strongly encourages long episodes
+        r_alive = torch.ones(self.num_envs, device=self.device) * 0.25  # +3 per step alive — strongly encourages long episodes
         # After computing base_lin_vel
         vel_norm_xy = torch.norm(base_lin_vel[:, :2], dim=1)  # forward + lateral speed
         r_no_movement = -3.0 * (vel_norm_xy < 0.3).float()  # -3 if speed < 0.3 m/s
@@ -243,23 +416,24 @@ class Go1Env(DirectRLEnv):
         r_action_rate = - torch.sum((self._actions - self._previous_actions) ** 2, dim=1) * 0.005
         r_smoothness = - torch.sum((self._actions - 2 * self._previous_actions + self._prev_prev_actions) ** 2, dim=1) * 0.005
 
+        r_backward_penalty = -1.0 * (base_lin_vel[:, 0] < 0.0).float()
+
         # === Total reward ===
         total_reward = (
                 r_lin_vel + r_ang_vel + r_lin_vel_z + r_ang_vel_xy +
                 r_orientation + r_joint_acc + r_joint_power + r_base_height +
-                r_foot_clearance + r_action_rate + r_smoothness + r_lateral_vel + r_alive + r_no_movement
+                r_foot_clearance + r_action_rate + r_smoothness + r_lateral_vel + r_alive + r_no_movement + r_backward_penalty
         )
 
         # === Accumulate per-episode sums for curriculum / logging ===
         reward_terms = [
             r_lin_vel, r_ang_vel, r_lin_vel_z, r_ang_vel_xy,
             r_orientation, r_joint_acc, r_joint_power, r_base_height,
-            r_foot_clearance, r_action_rate, r_smoothness + r_lateral_vel + r_alive + r_no_movement
+            r_foot_clearance, r_action_rate, r_smoothness, r_lateral_vel, r_alive, r_no_movement, r_backward_penalty
         ]
         for key, value in zip(self._episode_sums.keys(), reward_terms):
             self._episode_sums[key] += value
 
-        self._global_step += 1
         return total_reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -269,6 +443,9 @@ class Go1Env(DirectRLEnv):
 
         tipped = roll_pitch > 1.2  # was 0.9 → more tolerant
         too_low = base_height < 0.10  # was 0.18 → give more room
+        upside_down = gravity[:, 2] > -0.2
+        almost_inverted = gravity[:, 2] > 0.3
+        inverted = upside_down | almost_inverted
 
         poor_tracking = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         if self._global_step > 500000:
@@ -276,18 +453,27 @@ class Go1Env(DirectRLEnv):
             poor_tracking = (self._episode_sums[
                                  "tracking_lin_vel"] / steps) < 0.8  # Enabled with paper threshold 0.8 (was 0.5)
 
-        terminated = tipped | too_low | poor_tracking
+        terminated = tipped | too_low | poor_tracking | inverted
         truncated = self.episode_length_buf >= self.max_episode_length - 1
 
-        if self._global_step % 10 == 0:
-            print(
-                f"Step {self._global_step} | Tipped: {tipped.mean().item():.2f} | Too low: {too_low.mean().item():.2f} | Poor tracking: {poor_tracking.mean().item():.2f}")
+        # if self._global_step % 10 == 0:
+        #     print(
+        #         f"Step {self._global_step} | Tipped: {tipped.mean().item():.2f} | Too low: {too_low.mean().item():.2f} | Poor tracking: {poor_tracking.mean().item():.2f}")
 
         return terminated, truncated
 
     def _reset_idx(self, env_ids: torch.Tensor):
         if len(env_ids) == 0:
             return
+
+        # Print reward stats for resetting envs (per-episode summary)
+        if len(env_ids) > 0 and self._global_step % 200 == 0:  # print occasionally
+            print(f"\n=== Episode End Reward Summary (Step {self._global_step}) ===")
+            for key, value in self._episode_sums.items():
+                # Mean over resetting envs only
+                avg = value[env_ids].mean().item() if len(env_ids) > 0 else 0.0
+                print(f"{key:20}: {avg:.3f}")
+            print("=====================================\n")
 
         super()._reset_idx(env_ids)
 

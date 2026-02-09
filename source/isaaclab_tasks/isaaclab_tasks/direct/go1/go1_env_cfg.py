@@ -33,15 +33,6 @@ class EventCfg:
         },
     )
 
-    add_base_mass = EventTerm(
-        func=mdp.randomize_rigid_body_mass,
-        mode="startup",
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names="trunk"),
-            "mass_distribution_params": (-1.0, 2.0),
-            "operation": "add",
-        },
-    )
 
     randomize_actuator_gains = EventTerm(
         func=mdp.randomize_actuator_gains,
@@ -68,43 +59,27 @@ class EventCfg:
         },
     )
 
-    # external_force = EventTerm(
-    #     func=mdp.apply_external_force_torque,
-    #     mode="reset",  # Only apply on reset — safe and supported
-    #     params={
-    #         "asset_cfg": SceneEntityCfg("robot", body_names="trunk"),
-    #         "force_range": (-25.0, 25.0, -25.0, 25.0, -12.0, 12.0),
-    #         # flat 6 values: min_x max_x min_y max_y min_z max_z
-    #         "torque_range": (-8.0, 8.0, -8.0, 8.0, -8.0, 8.0),  # flat 6 values
-    #     },
-    # )
+    add_base_mass = EventTerm(
+        func=mdp.randomize_rigid_body_mass,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="trunk"),
+            "mass_distribution_params": (0.85, 1.15),  # ±15% around original trunk mass
+            "operation": "scale",  # ← This prevents negatives
+            "distribution": "uniform",
+        },
+    )
 
-# @configclass
-# class EventCfg:
-#     """Domain randomization events"""
-#     physics_material = EventTerm(
-#         func=mdp.randomize_rigid_body_material,
-#         mode="startup",
-#         params={
-#             "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
-#             "static_friction_range": (0.8, 1.25),
-#             "dynamic_friction_range": (0.6, 1.0),
-#             "restitution_range": (0.0, 0.1),
-#             "num_buckets": 64,
-#         },
-#     )
-#
-#     add_base_mass = EventTerm(
-#         func=mdp.randomize_rigid_body_mass,
-#         mode="startup",
-#         params={
-#             "asset_cfg": SceneEntityCfg("robot", body_names="trunk"),
-#             "mass_distribution_params": (-1.0, 2.0),
-#             "operation": "add",
-#         },
-#     )
-
-
+    randomize_body_mass = EventTerm(
+        func=mdp.randomize_rigid_body_mass,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*"),  # safe now
+            "mass_distribution_params": (0.80, 1.20),  # ±20% classic range
+            "operation": "scale",
+            "distribution": "uniform",
+        },
+    )
 
 @configclass
 class Go1SceneCfg(InteractiveSceneCfg):
@@ -133,8 +108,8 @@ class Go1SceneCfg(InteractiveSceneCfg):
         actuators={
             "legs": ImplicitActuatorCfg(
                 joint_names_expr=[".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"],
-                stiffness=30.0,  # Align to paper/repo (was 10.0)
-                damping=0.75,  # Align to paper/repo (was 0.2)
+                stiffness=60.0,  # Align to paper/repo (was 10.0)
+                damping=2.5,  # Align to paper/repo (was 0.2)
                 effort_limit=23.5,
             ),
         },
@@ -182,7 +157,7 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
         #     heading=(-np.pi, np.pi),
         # ),
         ranges=mdp.commands.UniformVelocityCommandCfg.Ranges(
-            lin_vel_x=(1.2, 2.2),  # Strong positive forward — no backward
+            lin_vel_x=(0.8, 1.8),  # Strong positive forward — no backward
             lin_vel_y=(0.0, 0.0),  # Zero lateral
             ang_vel_z=(0.0, 0.0),  # Zero yaw — straight line only
             heading=(-np.pi / 10, np.pi / 10),  # Small heading
@@ -190,10 +165,9 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
         heading_command=True,
     )
 
-    # Simulation
-    sim: SimulationCfg = SimulationCfg(
-        dt=1.0 / 400.0,  # 400 Hz physics for more stability (was 1/200)
-        render_interval=decimation,  # Render every policy step
+    sim = SimulationCfg(
+        dt=0.002,  # 500 Hz — match real Go1
+        render_interval=decimation,
         gravity=(0.0, 0.0, -9.81),
         physics_material=sim_utils.RigidBodyMaterialCfg(
             static_friction=1.0,
