@@ -108,8 +108,8 @@ class Go1SceneCfg(InteractiveSceneCfg):
         actuators={
             "legs": ImplicitActuatorCfg(
                 joint_names_expr=[".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"],
-                stiffness=60.0,  # Align to paper/repo (was 10.0)
-                damping=2.5,  # Align to paper/repo (was 0.2)
+                stiffness=40.0,  # Align to paper/repo (was 10.0)
+                damping=2.0,  # Align to paper/repo (was 0.2)
                 effort_limit=23.5,
             ),
         },
@@ -157,7 +157,7 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
         #     heading=(-np.pi, np.pi),
         # ),
         ranges=mdp.commands.UniformVelocityCommandCfg.Ranges(
-            lin_vel_x=(0.8, 1.8),  # Strong positive forward — no backward
+            lin_vel_x=(0.1, 0.8),  # Strong positive forward — no backward
             lin_vel_y=(0.0, 0.0),  # Zero lateral
             ang_vel_z=(0.0, 0.0),  # Zero yaw — straight line only
             heading=(-np.pi / 10, np.pi / 10),  # Small heading
