@@ -133,7 +133,7 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
     decimation = 8  # Updated: 400 Hz physics / 8 = 50 Hz policy
 
     # Environment settings
-    num_envs = 1000 #4096
+    num_envs = 1#4096
     env_spacing = 3.0
 
     # HIMLoco history
@@ -166,8 +166,8 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
     )
 
     sim = SimulationCfg(
-        dt=0.002,  # 500 Hz — match real Go1
-        render_interval=decimation,
+        dt=0.02,  # 500 Hz — match real Go1
+        render_interval=1,
         gravity=(0.0, 0.0, -9.81),
         physics_material=sim_utils.RigidBodyMaterialCfg(
             static_friction=1.0,
