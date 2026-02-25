@@ -108,7 +108,7 @@ class Go1SceneCfg(InteractiveSceneCfg):
         actuators={
             "legs": ImplicitActuatorCfg(
                 joint_names_expr=[".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"],
-                stiffness=40.0,  # Align to paper/repo (was 10.0)
+                stiffness=50.0,  # Align to paper/repo (was 10.0)
                 damping=2.0,  # Align to paper/repo (was 0.2)
                 effort_limit=23.5,
             ),
