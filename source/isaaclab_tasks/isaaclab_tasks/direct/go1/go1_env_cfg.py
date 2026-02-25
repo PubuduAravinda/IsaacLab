@@ -108,7 +108,7 @@ class Go1SceneCfg(InteractiveSceneCfg):
         actuators={
             "legs": ImplicitActuatorCfg(
                 joint_names_expr=[".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"],
-                stiffness=40.0,  # Align to paper/repo (was 10.0)
+                stiffness=35.0,  # Align to paper/repo (was 10.0)
                 damping=2.0,  # Align to paper/repo (was 0.2)
                 effort_limit=23.5,
             ),
@@ -133,7 +133,7 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
     decimation = 8  # Updated: 400 Hz physics / 8 = 50 Hz policy
 
     # Environment settings
-    num_envs = 1000 #4096
+    num_envs = 4096
     env_spacing = 3.0
 
     # HIMLoco history
@@ -143,7 +143,7 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
     state_space = spaces.Box(low=-np.inf, high=np.inf, shape=(0,), dtype=np.float32)
 
     # Action scaling - CRITICAL: legged_gym Go1 uses 0.25
-    action_scale = 0.25
+    # action_scale = 0.25
 
     # Velocity commands - LIMITED for small dogs per HIMLoco issue #6
     commands = mdp.commands.UniformVelocityCommandCfg(
@@ -157,7 +157,7 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
         #     heading=(-np.pi, np.pi),
         # ),
         ranges=mdp.commands.UniformVelocityCommandCfg.Ranges(
-            lin_vel_x=(0.1, 0.8),  # Strong positive forward — no backward
+            lin_vel_x=(0.5, 2.0),  # Strong positive forward — no backward
             lin_vel_y=(0.0, 0.0),  # Zero lateral
             ang_vel_z=(0.0, 0.0),  # Zero yaw — straight line only
             heading=(-np.pi / 10, np.pi / 10),  # Small heading
@@ -182,8 +182,8 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
         terrain_type="plane",
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
-            static_friction=1.0,
-            dynamic_friction=1.0,
+            static_friction=0.7,
+            dynamic_friction=0.7,
             restitution=0.0,
         ),
     )

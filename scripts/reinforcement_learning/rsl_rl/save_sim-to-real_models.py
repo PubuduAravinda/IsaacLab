@@ -1,199 +1,228 @@
-# export_himloco_full.py — Export actor + encoder from checkpoint
+#!/usr/bin/env python3
+"""
+Export HIMLoco policy and encoder for deployment on real Go1
+Exports from dual checkpoint system:
+  - model_XXXX.pt (contains actor/critic)
+  - model_XXXX_himloco.pt (contains encoder_source, encoder_target, prototypes)
+"""
+
 import torch
 import torch.nn as nn
+import sys
 
-checkpoint_path = "/home/sripu715/IsaacLab/scripts/reinforcement_learning/rsl_rl/logs/rsl_rl/go1_himloco/2026-02-03_21-23-53/model_500.pt"
-output_actor = "/home/sripu715/IsaacLab/scripts/reinforcement_learning/rsl_rl/logs/rsl_rl/go1_himloco/2026-02-03_21-23-53/himloco_policy_full.pt"
-output_encoder = "/home/sripu715/IsaacLab/scripts/reinforcement_learning/rsl_rl/logs/rsl_rl/go1_himloco/2026-02-03_21-23-53/himloco_encoder.pt"
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+checkpoint_base = "/home/sripu715/IsaacLab/scripts/reinforcement_learning/rsl_rl/logs/rsl_rl/go1_himloco/2026-02-21_19-33-22/model_24500"
+output_dir = "/home/sripu715/IsaacLab/scripts/reinforcement_learning/rsl_rl/logs/rsl_rl/go1_himloco/2026-02-21_19-33-22/go1_deployment"
 
-# Load checkpoint
-checkpoint = torch.load(checkpoint_path, map_location="cpu")
+policy_checkpoint = f"{checkpoint_base}.pt"
+himloco_checkpoint = f"{checkpoint_base}_himloco.pt"
 
-# Debug keys
-print("Checkpoint keys:", list(checkpoint.keys()))
+output_actor = f"{output_dir}/actor.pt"
+output_encoder = f"{output_dir}/encoder.pt"
 
-# Load state_dict (handle different keys)
-if 'model_state_dict' in checkpoint:
-    state_dict = checkpoint['model_state_dict']
-elif 'state_dict' in checkpoint:
-    state_dict = checkpoint['state_dict']
-elif 'actor' in checkpoint:
-    state_dict = checkpoint['actor']
-else:
-    state_dict = checkpoint  # flat dict
-    print("Assuming flat checkpoint as state_dict")
 
-# === Actor (64D input) ===
+# ============================================================================
+# ACTOR NETWORK (Policy)
+# ============================================================================
 class Actor(nn.Module):
+    """
+    HIMLoco Actor: 64D observation → 12D action
+    Input: [base_obs(45) + encoder_latent(19)] = 64D
+    Output: 12D joint position targets (NOT tanh! Direct targets)
+    """
+
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(64, 512), nn.ELU(),
             nn.Linear(512, 256), nn.ELU(),
             nn.Linear(256, 128), nn.ELU(),
-            nn.Linear(128, 12), nn.Tanh()  # tanh output for bounded actions
+            nn.Linear(128, 12)  # NO ACTIVATION! Direct joint targets
         )
 
     def forward(self, obs):
+        """
+        Args:
+            obs: (batch, 64) = [base_obs(45) + encoder_out(19)]
+        Returns:
+            actions: (batch, 12) joint position targets
+        """
         return self.net(obs)
 
-actor = Actor()
-actor.load_state_dict(state_dict, strict=False)  # ignore extra keys like critic
-actor.eval()
 
-scripted_actor = torch.jit.script(actor)
-scripted_actor.save(output_actor)
-print(f"Exported actor (policy) to: {output_actor}")
-
-# === Encoder (225D history input → 19D latent) ===
+# ============================================================================
+# ENCODER NETWORK
+# ============================================================================
 class Encoder(nn.Module):
+    """
+    HIMLoco Encoder: 225D history → 19D latent
+    Input: [obs_history(45 × 5)] = 225D (last 5 timesteps)
+    Output: 19D latent encoding
+    """
+
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(225, 512), nn.ReLU(),
             nn.Linear(512, 256), nn.ReLU(),
             nn.Linear(256, 128), nn.ReLU(),
-            nn.Linear(128, 19),
+            nn.Linear(128, 19)  # 19D latent
         )
 
-    def forward(self, x):
-        return self.net(x)
-
-encoder = Encoder()
-encoder.load_state_dict(state_dict, strict=False)  # ignore extra keys
-encoder.eval()
-
-scripted_encoder = torch.jit.script(encoder)
-scripted_encoder.save(output_encoder)
-print(f"Exported encoder to: {output_encoder}")
-
-# export_himloco_full.py — Export actor + encoder for full 64D
-# export_himloco_full.py — Export actor + encoder from your latest checkpoint
-#
-# import torch
-# import torch.nn as nn
-#
-# checkpoint_path = "/home/sripu715/IsaacLab/scripts/reinforcement_learning/rsl_rl/logs/rsl_rl/go1_himloco/2026-02-03_21-23-53/model_500.pt"
-# output_actor = "/home/sripu715/IsaacLab/scripts/reinforcement_learning/rsl_rl/logs/rsl_rl/go1_himloco/2026-02-03_21-23-53/himloco_policy_full.pt"
-# output_encoder = "/home/sripu715/IsaacLab/scripts/reinforcement_learning/rsl_rl/logs/rsl_rl/go1_himloco/2026-02-03_21-23-53/himloco_encoder.pt"
-#
-# # Load checkpoint
-# checkpoint = torch.load(checkpoint_path, map_location="cpu")
-#
-# # Debug keys
-# print("Checkpoint keys:", list(checkpoint.keys()))
-#
-# # Load model weights (usually 'model_state_dict' in RSL-RL)
-# if 'model_state_dict' in checkpoint:
-#     model_state_dict = checkpoint['model_state_dict']
-#     print("Loaded from 'model_state_dict'")
-# else:
-#     raise KeyError("No 'model_state_dict' found. Check checkpoint keys above.")
-#
-# # === Actor (64D input) ===
-# class Actor(nn.Module):
-#     def __init__(self):
-#         super().__init__()
-#         self.net = nn.Sequential(
-#             nn.Linear(64, 512),
-#             nn.ELU(),
-#             nn.Linear(512, 256),
-#             nn.ELU(),
-#             nn.Linear(256, 128),
-#             nn.ELU(),
-#             nn.Linear(128, 12),
-#             nn.Tanh()
-#         )
-#
-#     def forward(self, obs):
-#         return self.net(obs)
-#
-# actor = Actor()
-# actor.load_state_dict(model_state_dict, strict=False)
-# actor.eval()
-# scripted_actor = torch.jit.script(actor)
-# scripted_actor.save(output_actor)
-# print(f"Exported actor (policy) to: {output_actor}")
-#
-# # === Encoder (225D input → 19D latent) ===
-# class Encoder(nn.Module):
-#     def __init__(self):
-#         super().__init__()
-#         self.net = nn.Sequential(
-#             nn.Linear(225, 512),
-#             nn.ReLU(),
-#             nn.Linear(512, 256),
-#             nn.ReLU(),
-#             nn.Linear(256, 128),
-#             nn.ReLU(),
-#             nn.Linear(128, 19),
-#         )
-#
-#     def forward(self, x):
-#         return self.net(x)
-#
-# encoder = Encoder()
-# encoder.load_state_dict(model_state_dict, strict=False)  # encoder weights are usually in same dict
-# encoder.eval()
-# scripted_encoder = torch.jit.script(encoder)
-# scripted_encoder.save(output_encoder)
-# print(f"Exported encoder to: {output_encoder}")
+    def forward(self, history):
+        """
+        Args:
+            history: (batch, 225) = flattened last 5 obs
+        Returns:
+            latent: (batch, 19) encoded representation
+        """
+        return self.net(history)
 
 
+# ============================================================================
+# EXPORT FUNCTIONS
+# ============================================================================
+def export_actor(checkpoint_path, output_path):
+    """Export actor (policy) from main checkpoint"""
+    print(f"\n{'=' * 80}")
+    print("EXPORTING ACTOR (Policy Network)")
+    print(f"{'=' * 80}")
 
-# # save_sim-to-real_models.py — FINAL VERSION (handles flat or nested state_dict)
-# import torch
-# import torch.nn as nn
-#
-# checkpoint_path = "/home/sripu715/IsaacLab/scripts/reinforcement_learning/rsl_rl/logs/rsl_rl/go1_himloco/walk_farward_2026-01-13_14-02-13/model_100.pt"
-# output_path = "/home/sripu715/IsaacLab/scripts/reinforcement_learning/rsl_rl/logs/rsl_rl/go1_himloco/walk_farward_2026-01-13_14-02-13/himloco_policy_45d.pt"
-#
-# # Load checkpoint
-# checkpoint = torch.load(checkpoint_path, map_location="cpu")
-#
-# # Debug: print top-level keys to see the structure
-# print("Checkpoint keys:", list(checkpoint.keys()) if isinstance(checkpoint, dict) else "Not a dict")
-#
-# # Try common RSL-RL key patterns
-# if isinstance(checkpoint, dict):
-#     possible_keys = ["actor_state_dict", "model_state_dict", "actor", "state_dict", "model"]
-#     actor_state_dict = None
-#     for key in possible_keys:
-#         if key in checkpoint:
-#             actor_state_dict = checkpoint[key]
-#             print(f"Found actor state_dict under key: '{key}'")
-#             break
-#     if actor_state_dict is None:
-#         # If no key found, assume the checkpoint IS the flat state_dict
-#         actor_state_dict = checkpoint
-#         print("Using flat checkpoint as state_dict")
-# else:
-#     raise ValueError("Checkpoint is not a dict — unexpected format")
-#
-# # Re-create actor with 45D input (no embedding)
-# class Actor45D(nn.Module):
-#     def __init__(self):
-#         super().__init__()
-#         self.net = nn.Sequential(
-#             nn.Linear(45, 512),
-#             nn.ELU(),
-#             nn.Linear(512, 256),
-#             nn.ELU(),
-#             nn.Linear(256, 128),
-#             nn.ELU(),
-#             nn.Linear(128, 12),
-#             nn.Tanh()  # assuming policy outputs [-1,1]
-#         )
-#
-#     def forward(self, obs):
-#         return self.net(obs)
-#
-# model = Actor45D()
-# model.load_state_dict(actor_state_dict, strict=False)  # strict=False ignores missing/extra keys
-# model.eval()
-#
-# # Script it
-# scripted_model = torch.jit.script(model)
-# scripted_model.save(output_path)
-# print(f"\nSUCCESS! Exported 45D policy to:\n{output_path}")
-# print("Copy this file to Raspberry Pi and use in himloco_sim_to_real.py")
+    # Load checkpoint
+    print(f"Loading from: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+
+    # Debug structure
+    print("\nCheckpoint keys:", list(checkpoint.keys())[:10])
+
+    # Extract actor state dict
+    if 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+    else:
+        state_dict = checkpoint
+
+    # Filter actor weights (remove critic, other components)
+    actor_state_dict = {}
+    for key, value in state_dict.items():
+        if key.startswith('actor.'):
+            # Remove 'actor.' prefix and add 'net.' prefix
+            # 'actor.0.weight' → 'net.0.weight'
+            new_key = key.replace('actor.', 'net.')
+            actor_state_dict[new_key] = value
+
+    print(f"\nActor layers found: {len(actor_state_dict)} parameters")
+    print("Sample keys:", list(actor_state_dict.keys())[:5])
+
+    # Create and load actor
+    actor = Actor()
+    actor.load_state_dict(actor_state_dict, strict=True)
+    actor.eval()
+
+    # Test forward pass
+    test_input = torch.randn(1, 64)
+    with torch.no_grad():
+        output = actor(test_input)
+    print(f"\nTest forward pass:")
+    print(f"  Input shape:  {test_input.shape}")
+    print(f"  Output shape: {output.shape}")
+    print(f"  Output range: [{output.min():.3f}, {output.max():.3f}]")
+
+    # Export as TorchScript
+    scripted_actor = torch.jit.script(actor)
+    scripted_actor.save(output_path)
+    print(f"\n✓ Exported actor to: {output_path}")
+
+    return actor
+
+
+def export_encoder(checkpoint_path, output_path):
+    """Export encoder from HIMLoco checkpoint"""
+    print(f"\n{'=' * 80}")
+    print("EXPORTING ENCODER (History Encoding Network)")
+    print(f"{'=' * 80}")
+
+    # Load checkpoint
+    print(f"Loading from: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+
+    # Debug structure
+    print("\nCheckpoint keys:", list(checkpoint.keys()))
+
+    # Extract encoder_source (the active encoder at end of training)
+    if 'encoder_source' in checkpoint:
+        raw_state_dict = checkpoint['encoder_source']
+    else:
+        raise ValueError("No 'encoder_source' found in HIMLoco checkpoint!")
+
+    # Add 'net.' prefix if needed
+    encoder_state_dict = {}
+    for key, value in raw_state_dict.items():
+        if not key.startswith('net.'):
+            new_key = f'net.{key}'
+        else:
+            new_key = key
+        encoder_state_dict[new_key] = value
+
+    print(f"\nEncoder layers found: {len(encoder_state_dict)} parameters")
+    print("Sample keys:", list(encoder_state_dict.keys())[:5])
+
+    # Create and load encoder
+    encoder = Encoder()
+    encoder.load_state_dict(encoder_state_dict, strict=True)
+    encoder.eval()
+
+    # Test forward pass
+    test_input = torch.randn(1, 225)  # 45 obs × 5 history
+    with torch.no_grad():
+        output = encoder(test_input)
+    print(f"\nTest forward pass:")
+    print(f"  Input shape:  {test_input.shape}")
+    print(f"  Output shape: {output.shape}")
+    print(f"  Output range: [{output.min():.3f}, {output.max():.3f}]")
+
+    # Export as TorchScript
+    scripted_encoder = torch.jit.script(encoder)
+    scripted_encoder.save(output_path)
+    print(f"\n✓ Exported encoder to: {output_path}")
+
+    return encoder
+
+
+# ============================================================================
+# MAIN EXPORT
+# ============================================================================
+if __name__ == "__main__":
+    import os
+
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+
+    print("\n" + "=" * 80)
+    print("HIMLoco Go1 Deployment Export")
+    print("=" * 80)
+    print(f"\nPolicy checkpoint: {policy_checkpoint}")
+    print(f"HIMLoco checkpoint: {himloco_checkpoint}")
+    print(f"Output directory: {output_dir}")
+
+    # Export both networks
+    try:
+        actor = export_actor(policy_checkpoint, output_actor)
+        encoder = export_encoder(himloco_checkpoint, output_encoder)
+
+        print("\n" + "=" * 80)
+        print("✓ EXPORT SUCCESSFUL!")
+        print("=" * 80)
+        print(f"\nDeployment files ready:")
+        print(f"  Actor:   {output_actor}")
+        print(f"  Encoder: {output_encoder}")
+        print(f"\nCopy these files to Go1's Raspberry Pi for deployment.")
+        print("=" * 80 + "\n")
+
+    except Exception as e:
+        print(f"\n✗ EXPORT FAILED: {e}")
+        import traceback
+
+        traceback.print_exc()
+        sys.exit(1)

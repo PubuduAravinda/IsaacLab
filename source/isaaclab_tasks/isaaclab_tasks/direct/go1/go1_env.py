@@ -51,6 +51,7 @@ class Go1Env(DirectRLEnv):
             "tracking_lin_vel", "tracking_ang_vel", "lin_vel_z", "ang_vel_xy",
             "orientation", "joint_acc", "joint_power", "base_height",
             "foot_clearance", "action_rate", "smoothness", "backward",
+            "r_evenness"
         ]}
 
         self._global_step = 0
@@ -65,7 +66,10 @@ class Go1Env(DirectRLEnv):
             foot_idx.append(idx[0])
         self.foot_indices = torch.tensor(foot_idx, device=self.device, dtype=torch.long)
 
+        print("Num bodies:", self._robot.num_bodies)
         print("Foot indices:", self.foot_indices)
+        print("Sample body names:", self._robot.body_names[:10])  # check actual names
+
         print("Joint order:")
         for i, name in enumerate(self._robot.joint_names):
             print(f"  {i:2d}: {name}")
@@ -196,8 +200,28 @@ class Go1Env(DirectRLEnv):
             l_t_norm = F.normalize(l_t, dim=1, eps=1e-6)
             proto_norm = F.normalize(self.prototypes, dim=1, eps=1e-6)
 
+            # Add this
+            if self._global_step % 150 == 0 and self._global_step > 0:
+                l_s_norm_mean = l_s_norm.norm(dim=1).mean().item()  # Should be ~1.0 post-norm
+                l_t_norm_mean = l_t_norm.norm(dim=1).mean().item()
+                proto_norm_mean = proto_norm.norm(dim=1).mean().item()
+                print(
+                    f"[LATENT DEBUG] step {self._global_step} | l_s_norm_mean: {l_s_norm_mean:.4f} | l_t_norm_mean: {l_t_norm_mean:.4f} | proto_norm_mean: {proto_norm_mean:.4f}")
+
+
             sim_s = l_s_norm @ proto_norm.t() / 0.1  # [N, 16]
             sim_t = l_t_norm @ proto_norm.t() / 0.1  # [N, 16]
+
+            # Add this
+            if self._global_step % 150 == 0 and self._global_step > 0:
+                sim_s_mean = sim_s.mean().item()
+                sim_s_std = sim_s.std().item()
+                sim_t_mean = sim_t.mean().item()
+                sim_t_std = sim_t.std().item()
+                print(
+                    f"[SWAV DEBUG] step {self._global_step} | sim_s mean/std: {sim_s_mean:.4f}/{sim_s_std:.4f} | sim_t mean/std: {sim_t_mean:.4f}/{sim_t_std:.4f}")
+
+
 
             # Soft cross-entropy (stable SwAV without Sinkhorn)
             loss_swav = 0.5 * (
@@ -291,99 +315,44 @@ class Go1Env(DirectRLEnv):
         r_joint_power = -torch.sum(torch.abs(dof_torque) * torch.abs(dof_vel), dim=1) * 2e-5
 
         # 8. Body height (target 0.34m) - paper weight
-        r_base_height = -((base_height - 0.34) ** 2) * 1.0
+        r_base_height = -((base_height - 0.30) ** 2) * 1.5
 
         # 9. Foot clearance  -0.01  (paper weight)
         #    r = -0.01 * Σᵢ (p_target_z - pᵢ_z)² · vᵢ_xy
-        # 9. Contact-Based Gait Enforcement
-        #    Use actual contact forces instead of trying to infer from heights/velocities
-        r_foot_clearance = torch.zeros(self.num_envs, device=self.device)
+        # 9. Foot clearance (HIMLoco paper: -0.01 * sum (p_target_z - p_i_z)^2 * v_i_xy)
+        # p_target_z = desired swing clearance height in base frame (z-up)
+        p_target_z = 0.08  # tune between 0.05–0.12 depending on gait preference
 
-        try:
-            contact_sensor = self.scene.sensors.get("contact_sensor", None)
-            if contact_sensor is not None and contact_sensor.data.net_forces_w is not None:
-                # Contact sensor tracks ONLY the 4 feet, so indices are [0, 1, 2, 3]
-                # NOT the body indices from the full robot!
-                net_forces = contact_sensor.data.net_forces_w  # Shape: (N, 4, 3) for 4 feet
+        # Get world-frame foot positions and velocities
+        foot_pos_w = self._robot.data.body_pos_w[:, self.foot_indices]  # [N, 4, 3]
+        foot_vel_w = self._robot.data.body_lin_vel_w[:, self.foot_indices]  # [N, 4, 3]
 
-                # Get Z-axis contact forces for all 4 feet (indices 0-3)
-                foot_forces = net_forces[:, :, 2]  # (N, 4) - all 4 feet
+        # Base (root) world-frame position and orientation
+        root_pos_w = self._robot.data.root_pos_w  # [N, 3]
+        root_quat_w = self._robot.data.root_quat_w  # [N, 4] (w, x, y, z)
 
-                # Detect which feet are in contact (force > threshold)
-                in_contact = (foot_forces.abs() > 1.0).float()  # (N, 4) binary
-                num_feet_contact = in_contact.sum(dim=1)  # (N,)
+        # Compute base-relative foot positions (subtract root pos)
+        foot_pos_b = foot_pos_w - root_pos_w.unsqueeze(1)  # [N, 4, 3]
 
-                # Reward 1: Penalize having <2 or >3 feet in contact
-                r_contact_count = torch.zeros(self.num_envs, device=self.device)
-                r_contact_count += -5.0 * (num_feet_contact < 2.0).float()
-                r_contact_count += -2.0 * (num_feet_contact > 3.0).float()
+        # For velocities: approximate base-relative by subtracting root velocity (good enough for xy norm)
+        # If you want exact rotated frame, add rotation later – but for clearance penalty this is usually sufficient
+        foot_vel_b_approx = foot_vel_w - self._robot.data.root_lin_vel_w.unsqueeze(1)  # [N, 4, 3]
 
-                # Reward 2: Track cumulative contact time per foot
-                if not hasattr(self, 'foot_contact_time'):
-                    self.foot_contact_time = torch.zeros(self.num_envs, 4, device=self.device)
+        # Horizontal speed norm (xy plane)
+        v_xy = torch.norm(foot_vel_b_approx[:, :, :2], dim=-1)  # [N, 4]
 
-                self.foot_contact_time += in_contact
+        # Height error in base z (upward)
+        height_error_sq = (p_target_z - foot_pos_b[:, :, 2]) ** 2  # [N, 4]
 
-                # Reward 3: NEW - Contact FREQUENCY variance penalty
-                #           All 4 feet should have similar contact frequencies
-                #           Apply this from the START (not after 200 steps)
+        # Reward (negative penalty)
+        r_foot_clearance = -0.01 * (height_error_sq * v_xy).sum(dim=-1)  # [N]
 
-                # Calculate contact frequency for each foot (as percentage)
-                episode_len = self.episode_length_buf.unsqueeze(1).float().clamp(min=1.0)  # (N, 1)
-                contact_freq = self.foot_contact_time / episode_len  # (N, 4) range [0, 1]
-
-                # In proper trot: all 4 feet should have freq ~0.5 (50% contact, 50% swing)
-                # In bipedal: 2 feet freq=1.0, 2 feet freq=0.0 → HIGH variance
-                # In tripod: 3 feet freq=1.0, 1 foot freq=0.0 → HIGH variance
-
-                # Compute variance across the 4 feet
-                mean_freq = contact_freq.mean(dim=1, keepdim=True)  # (N, 1)
-                freq_variance = ((contact_freq - mean_freq) ** 2).mean(dim=1)  # (N,)
-
-                # Penalize high variance (unequal contact frequencies)
-                # variance = 0 → all feet contact equally ✓
-                # variance > 0.1 → some feet never touch ✗
-                r_freq_variance = -20.0 * freq_variance
-
-                # Combine all contact rewards
-                r_foot_clearance = r_contact_count + r_freq_variance
-
-                # Detailed debugging
-                if self._global_step % 500 == 0 and self._global_step > 0:
-                    env0 = 0
-                    print(f"\n[CONTACT DEBUG] Step {self._global_step}")
-                    print("=" * 80)
-                    foot_names = ["FL", "FR", "RL", "RR"]
-
-                    # Calculate frequencies for env 0
-                    ep_len = max(self.episode_length_buf[env0].item(), 1)
-
-                    for i, name in enumerate(foot_names):
-                        force = foot_forces[env0, i].item()
-                        contact = in_contact[env0, i].item()
-                        cum_time = self.foot_contact_time[env0, i].item()
-                        freq = cum_time / ep_len  # Contact frequency
-                        print(f"{name}: force={force:6.1f}N, contact={contact:.0f}, "
-                              f"cumulative={cum_time:3.0f}, frequency={freq:.2f}")
-
-                    # Show variance
-                    variance = freq_variance[env0].item()
-                    print(f"\nFeet in contact: {num_feet_contact[env0].item():.0f}/4")
-                    print(f"Contact count penalty: {r_contact_count[env0].item():.2f}")
-                    print(f"Frequency variance: {variance:.4f}")
-                    print(f"Variance penalty: {r_freq_variance[env0].item():.2f}")
-                    print(f"Total foot reward: {r_foot_clearance[env0].item():.2f}")
-                    print("=" * 80 + "\n")
-            else:
-                # Fallback if contact sensor unavailable
-                if self._global_step % 500 == 0 and self._global_step > 0:
-                    print("[CONTACT WARN] Contact sensor not available, foot reward = 0")
-
-        except Exception as e:
-            if self._global_step % 500 == 0:
-                print(f"[CONTACT ERROR] {e}")
-                import traceback
-                traceback.print_exc()
+        # Debug print (keep your existing %500 style)
+        if self._global_step % 500 == 0 and self._global_step > 0:
+            print(f"[FOOT CLEARANCE DEBUG] Step {self._global_step} | Env 0 r: {r_foot_clearance[0]:.4f}")
+            print(f"  Heights (base z): {foot_pos_b[0, :, 2].cpu().numpy().round(3)}")
+            print(f"  v_xy norms:       {v_xy[0].cpu().numpy().round(3)}")
+            print(f"  height_errors^2:  {height_error_sq[0].cpu().numpy().round(3)}")
 
         # 10. Action rate  -0.01
         r_action_rate = -torch.sum(
@@ -398,13 +367,37 @@ class Go1Env(DirectRLEnv):
         # 12. Small backward penalty (not in paper but needed to prevent backward walking)
         r_backward = -1.0 * (base_lin_vel[:, 0] < -0.1).float()
 
+        # Optional: Evenness bonus (+0.005 if all feet contact freq ~0.25–0.35)
+        # In _get_rewards() — replace your contact block with this:
+
+        # Get z-forces from the 4 contact sensors (order: FL, FR, RL, RR — matches your find_bodies order)
+        foot_contact_forces_z = self.scene.sensors["contact_sensor"].data.net_forces_w[:, :, 2]  # [N, 4]
+
+        # Threshold for "in contact" (tune 5–20 N depending on robot mass ~12kg + dynamics)
+        in_contact = (foot_contact_forces_z > 8.0).float()  # [N, 4]
+
+        # Average contact fraction per env (over the 4 feet, per step)
+        contact_freq = in_contact.mean(dim=1)  # [N] — values ~0.0 to 1.0, target ~0.30 for balanced cycling
+
+        # Gaussian reward peaked at 30% average contact (encourages even touch/swing)
+        r_evenness = 0.005 * torch.exp(-10.0 * (contact_freq - 0.30) ** 2)  # [N]
+
+        # Optional debug (keep your %500 style)
+        if self._global_step % 500 == 0 and self._global_step > 0:
+            print(f"[CONTACT DEBUG] Step {self._global_step} | Env 0")
+            print(f"  z-forces: {foot_contact_forces_z[0].cpu().numpy().round(2)} N")
+            print(f"  in_contact: {in_contact[0].cpu().numpy()}")
+            print(f"  contact_freq: {contact_freq[0]:.3f}")
+            print(f"  r_evenness: {r_evenness[0]:.4f}")
+
+
         # ── Total ───────────────────────────────────────────────────────────
         total_reward = (
                 r_lin_vel + r_ang_vel +
                 r_lin_vel_z + r_ang_vel_xy + r_orientation +
                 r_joint_acc + r_joint_power + r_base_height +
                 r_foot_clearance + r_action_rate + r_smoothness +
-                r_backward
+                r_backward + r_evenness
         )
 
         # ── Episode logging ─────────────────────────────────────────────────
@@ -412,11 +405,13 @@ class Go1Env(DirectRLEnv):
             "tracking_lin_vel", "tracking_ang_vel", "lin_vel_z", "ang_vel_xy",
             "orientation", "joint_acc", "joint_power", "base_height",
             "foot_clearance", "action_rate", "smoothness", "backward",
+            "r_evenness"
         ]
         vals = [
             r_lin_vel, r_ang_vel, r_lin_vel_z, r_ang_vel_xy,
             r_orientation, r_joint_acc, r_joint_power, r_base_height,
             r_foot_clearance, r_action_rate, r_smoothness, r_backward,
+            r_evenness
         ]
         for k, v in zip(keys, vals):
             self._episode_sums[k] += v
@@ -430,7 +425,7 @@ class Go1Env(DirectRLEnv):
         base_height = self._robot.data.root_pos_w[:, 2]
 
         tipped = roll_pitch > 1.5
-        too_low = base_height < 0.24  # Low threshold - let robot learn at any stable height
+        too_low = base_height < 0.22  # Low threshold - let robot learn at any stable height
         upside_down = gravity[:, 2] > 0.5
 
         if self._global_step % 100 == 0 and self._global_step > 0:

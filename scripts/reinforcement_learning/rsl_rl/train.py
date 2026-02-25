@@ -154,6 +154,23 @@ class CustomPPO(PPO):
                         # Backward pass
                         total_aux.backward()
 
+                        encoder_grad_norm = 0.0
+                        for p in self.original_env.encoder_source.parameters():
+                            if p.grad is not None:
+                                encoder_grad_norm += p.grad.norm().item() ** 2
+                        encoder_grad_norm = encoder_grad_norm ** 0.5
+
+                        proto_grad_norm = 0.0
+                        if self.original_env.prototypes.grad is not None:
+                            proto_grad_norm = self.original_env.prototypes.grad.norm().item()
+
+                        # Use global step for printing frequency (same as your aux loss print)
+                        if self.original_env._global_step % 150 == 0 and self.original_env._global_step > 0:
+                            print(
+                                f"[HIM GRAD DEBUG] step {self.original_env._global_step} | "
+                                f"encoder_norm: {encoder_grad_norm:.4f} | proto_norm: {proto_grad_norm:.4f}"
+                            )
+
                         # Clip gradients
                         him_params = []
                         if hasattr(self.original_env, 'encoder_source'):
