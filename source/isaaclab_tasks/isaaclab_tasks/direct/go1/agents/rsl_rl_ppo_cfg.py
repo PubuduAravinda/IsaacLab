@@ -18,14 +18,14 @@ class Go1RslRlPpoCfg(RslRlOnPolicyRunnerCfg):
 
     num_steps_per_env = 24                # Critical: ~2s rollout, matches paper
     max_iterations = 25000                 # Long training (adjust as needed)
-    save_interval = 500 #500                    # Save every 500 updates
+    save_interval = 100 #500                    # Save every 500 updates
     experiment_name = "go1_himloco"
     run_name = ""                          # Optional suffix
     empirical_normalization = False        # No running stats on obs (paper uses raw)
     policy_obs_normalization = False       # Important for proprioception
 
     policy: RslRlPpoActorCriticCfg = RslRlPpoActorCriticCfg(
-        init_noise_std=0.4,
+        init_noise_std=0.1,
         actor_hidden_dims=[512, 256, 128],   # Exact HIMLoco policy MLP
         critic_hidden_dims=[512, 256, 128],  # Same backbone
         activation="elu",
@@ -37,8 +37,8 @@ class Go1RslRlPpoCfg(RslRlOnPolicyRunnerCfg):
     algorithm: RslRlPpoAlgorithmCfg = RslRlPpoAlgorithmCfg(
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
-        clip_param=0.2,
-        entropy_coef=0.01,                  # Paper value — better exploration
+        clip_param=0.2,                      # standard PPO clip
+        entropy_coef=0.01,                   # Balanced — prevents collapse without over-randomising
         num_learning_epochs=5,
         num_mini_batches=4,                  # Good balance with large env count
         learning_rate=1.0e-3,

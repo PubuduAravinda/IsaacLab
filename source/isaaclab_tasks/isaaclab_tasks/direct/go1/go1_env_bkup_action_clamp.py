@@ -22,15 +22,6 @@ class Go1Env(DirectRLEnv):
 
         # ── Action buffers ────────────────────────────────────────────────────
         self._actions          = torch.zeros(self.num_envs, 12, device=self.device)
-
-        # Action scale — built once, reused every step (not rebuilt per step)
-        # network output ∈ [-1,1] × scale → physical joint delta from default pose
-        self._action_scale = torch.tensor(
-            [0.25, 0.25, 0.25, 0.25,   # hip:   ±0.25 rad lateral swing
-             0.5,  0.5,  0.5,  0.5,    # thigh: ±0.50 rad propulsion
-             0.5,  0.5,  0.5,  0.5],   # knee:  ±0.50 rad
-            device=self.device
-        )
         self._prev_actions     = torch.zeros_like(self._actions)
         self._prev_prev_actions= torch.zeros_like(self._actions)
         self._target_pos       = torch.zeros_like(self._actions)
@@ -58,16 +49,10 @@ class Go1Env(DirectRLEnv):
     def _pre_physics_step(self, actions: torch.Tensor):
         a = actions.clone()
 
-        # print('self._robot.data.default_joint_pos-->>',self._robot.data.default_joint_pos)
-        # print('self._robot.data.joint_names-->>',self._robot.data.joint_names)
-
-        # Action scaling — multiply by per-joint scale instead of hard clamp.
-        # Hard clamp caused saturation: policy learned to output ±999 knowing
-        # it lands at ±0.2, resulting in bang-bang hip control with no gradient.
-        # Scale instead: network output [-1,1] × scale → natural soft limits.
-        # Hip: small lateral motion only (0.25 rad)
-        # Thigh/knee: main propulsion (0.5 rad) — matches AnymalC action_scale=0.5
-        a = a * self._action_scale
+        # Hard joint-range clamps — prevents wild postures, forces thigh+knee gait
+        a[:, 0:4]  = torch.clamp(a[:, 0:4],  -0.2, 0.2)   # hip  (tight — small lateral only)
+        a[:, 4:8]  = torch.clamp(a[:, 4:8],  -1.2, 1.2)   # thigh (main propulsion)
+        a[:, 8:12] = torch.clamp(a[:, 8:12], -1.5, 1.5)   # knee
 
         self._prev_prev_actions[:] = self._prev_actions
         self._prev_actions[:]      = self._actions
@@ -98,7 +83,7 @@ class Go1Env(DirectRLEnv):
         obs = torch.cat([
             self.command_manager.command[:, :3],                              # 3
             self._robot.data.joint_pos - self._robot.data.default_joint_pos, # 12
-            torch.clamp(self._robot.data.joint_vel,       -5.0,  5.0),       # 12 — tighter clip, real Go1 rarely exceeds 5 rad/s
+            torch.clamp(self._robot.data.joint_vel,      -10.0, 10.0),       # 12
             torch.clamp(self._robot.data.root_ang_vel_b,  -5.0,  5.0),       # 3
             self._robot.data.projected_gravity_b,                             # 3
             self._prev_actions,                                               # 12
@@ -117,7 +102,7 @@ class Go1Env(DirectRLEnv):
         # ── 1. Forward velocity tracking (dominant positive signal) ──────────
         # Gaussian centred on commanded vx. Width 0.3 gives gradient even when
         # tracking is imperfect early in training (wider = easier to learn from).
-        r_forward = 6.0 * torch.exp(
+        r_forward = 4.0 * torch.exp(
             -((lin_vel[:, 0] - cmd[:, 0]) ** 2) / 0.25 ** 2
         )
 
