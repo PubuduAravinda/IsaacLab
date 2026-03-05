@@ -25,8 +25,9 @@ import numpy as np
 # ─────────────────────────────────────────────────────────────────────────────
 CHECKPOINT = (
     "/home/sripu715/IsaacLab/scripts/reinforcement_learning/rsl_rl/"
-    "logs/rsl_rl/go1_himloco/2026-03-03_16-08-46/model_7000.pt"
+    "logs/rsl_rl/go1_himloco/2026-03-04_21-34-36/model_20000.pt"
 )
+
 OUTPUT_DIR = os.path.join(os.path.dirname(CHECKPOINT), "go1_deploy")
 
 # ─────────────────────────────────────────────────────────────────────────────
