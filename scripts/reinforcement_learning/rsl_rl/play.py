@@ -20,6 +20,10 @@ parser.add_argument("--agent",        type=str, default="rsl_rl_cfg_entry_point"
 parser.add_argument("--seed",         type=int, default=None)
 parser.add_argument("--use_pretrained_checkpoint", action="store_true")
 parser.add_argument("--real-time",    action="store_true", default=False)
+parser.add_argument("--log",          action="store_true", default=False,
+                    help="Save sim_log_<checkpoint>_<ts>.npz for sim-real comparison")
+parser.add_argument("--log_steps",    type=int, default=1500,
+                    help="Steps to record when --log is set (default 1500 = 30s at 50Hz)")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -37,6 +41,8 @@ import gymnasium as gym
 import os
 import time
 import torch
+import numpy as np
+from datetime import datetime
 
 from rsl_rl.runners import OnPolicyRunner
 
@@ -134,6 +140,34 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
     runner.load(resume_path)
     print("[INFO] Checkpoint loaded.")
 
+    # ── Optional sim logger ───────────────────────────────────────────────────
+    # Enabled by --log flag. Captures same channels as real_log_*.npz from
+    # go1_deploy_final.py so you can run compare_sim_real.py directly.
+    go1_env = env.unwrapped.unwrapped  # Go1Env instance (unwrap twice)
+    if args_cli.log:
+        N = args_cli.log_steps
+        # Tell go1_env how many steps to buffer and activate it
+        go1_env._sim_log_maxsteps = N
+        for k in go1_env._slog:               # resize pre-alloc arrays to N
+            arr = go1_env._slog[k]
+            go1_env._slog[k] = (np.zeros(N, arr.dtype) if arr.ndim == 1
+                                 else np.zeros((N,) + arr.shape[1:], arr.dtype))
+        go1_env._slog_step   = 0
+        go1_env._slog_active = True           # go1_env.step() now writes buffers
+
+        # Hook registered AFTER export below — torch.jit.script can't serialize hooks.
+        _last_linear = None
+        try:
+            policy_nn_ref = runner.alg.policy
+        except AttributeError:
+            policy_nn_ref = runner.alg.actor_critic
+        for m in policy_nn_ref.actor.modules():
+            if isinstance(m, torch.nn.Linear):
+                _last_linear = m
+    else:
+        go1_env._slog_active = False          # make sure it stays off
+        _last_linear = None
+
     # ── Export policy for real robot ──────────────────────────────────────────
     try:
         policy_nn = runner.alg.policy
@@ -146,7 +180,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
     export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_dir, filename="policy.onnx")
     print(f"[INFO] Exported to: {export_dir}")
 
+    # ── Attach raw_net hook NOW (after JIT export — hook breaks torch.jit.script) ──
+    if args_cli.log and _last_linear is not None:
+        def _raw_net_hook(module, inp, out):
+            s = go1_env._slog_step
+            if go1_env._slog_active and s < go1_env._sim_log_maxsteps:
+                go1_env._slog["raw_net"][s] = out[0].detach().cpu().numpy()
+        _last_linear.register_forward_hook(_raw_net_hook)
+        print(f"[LOG] raw_net hook attached  (steps to record: {args_cli.log_steps})")
+    elif args_cli.log:
+        print("[LOG] WARNING: could not find actor output layer — raw_net will be zeros")
+
     # ── Inference loop ────────────────────────────────────────────────────────
+    # Disable obs noise — play.py runs clean inference (noise is training-only)
+    go1_env._obs_noise_enabled = False
     policy   = runner.get_inference_policy(device=env.unwrapped.device)
     dt       = env.unwrapped.step_dt
     obs      = env.get_observations()
@@ -164,9 +211,64 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
             if timestep >= args_cli.video_length:
                 break
 
+        # Stop when log buffer is full
+        if args_cli.log and go1_env._slog_step >= args_cli.log_steps:
+            print(f"[LOG] {args_cli.log_steps} steps recorded — stopping.")
+            break
+
         sleep = dt - (time.time() - t0)
         if args_cli.real_time and sleep > 0:
             time.sleep(sleep)
+
+    # ── Save sim log ──────────────────────────────────────────────────────────
+    if args_cli.log:
+        S        = go1_env._slog_step
+        ckpt_tag = os.path.splitext(os.path.basename(resume_path))[0]  # e.g. model_24999
+        ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_dir = os.path.join(log_dir, "sim_logs")
+        os.makedirs(save_dir, exist_ok=True)
+        out_path = os.path.join(save_dir, f"sim_log_{ckpt_tag}_{ts}.npz")
+
+        lo = go1_env._delta_soft_lo.cpu().numpy()
+        hi = go1_env._delta_soft_hi.cpu().numpy()
+        np.savez(out_path,
+            obs_raw    = go1_env._slog["obs_raw"][:S],
+            raw_net    = go1_env._slog["raw_net"][:S],
+            tanh_delta = go1_env._slog["tanh_delta"][:S],
+            target_q   = go1_env._slog["target_q"][:S],
+            actual_q   = go1_env._slog["actual_q"][:S],
+            actual_qd  = go1_env._slog["actual_qd"][:S],
+            proj_grav  = go1_env._slog["proj_grav"][:S],
+            ang_vel    = go1_env._slog["ang_vel"][:S],
+            lin_vel    = go1_env._slog["lin_vel"][:S],
+            cmd        = go1_env._slog["cmd"][:S],
+            contact    = go1_env._slog["contact"][:S],
+            tilt_deg   = go1_env._slog["tilt_deg"][:S],
+            reward     = go1_env._slog["reward"][:S],
+            default_q  = go1_env._robot.data.default_joint_pos[0].cpu().numpy(),
+            delta_lo   = lo,
+            delta_hi   = hi,
+            step_dt    = np.array([env.unwrapped.step_dt]),
+            src        = np.array(["sim"], dtype=object),
+            checkpoint = np.array([resume_path], dtype=object),
+        )
+
+        tilt  = go1_env._slog["tilt_deg"][:S]
+        lv    = go1_env._slog["lin_vel"][:S, 0]
+        td    = go1_env._slog["tanh_delta"][:S]
+        NAMES = ['FL_hip','FR_hip','RL_hip','RR_hip']
+        print(f"\n[LOG] Saved {S} steps → {out_path}")
+        print(f"  tilt   : mean={tilt.mean():.1f}°  max={tilt.max():.1f}°  "
+              f">20°:{(tilt>20).mean()*100:.0f}%")
+        print(f"  lv_x   : mean={lv.mean():.3f} m/s")
+        print(f"  raw_net: [{go1_env._slog['raw_net'][:S].min():.1f}, "
+              f"{go1_env._slog['raw_net'][:S].max():.1f}]")
+        print(f"  hip sat (at lo limit):")
+        for i, n in enumerate(NAMES):
+            sat = (td[:, i] <= lo[i] * 0.98).mean() * 100
+            print(f"    {n}: {sat:.0f}%  {'*** saturated' if sat > 30 else 'ok'}")
+        print(f"\n  Compare with real robot:")
+        print(f"  python compare_sim_real.py {out_path} <real_log_*.npz>")
 
     env.close()
     print("[INFO] Done.")

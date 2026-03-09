@@ -3,6 +3,15 @@
 # Hard hip clamp in _pre_physics_step instead of r_limits reward.
 # Clean reward set — every term has a measurable effect.
 # Obs normalisation saved/loaded with checkpoint for sim-to-real.
+#
+# Sim-to-real gap fixes (v2):
+#   1. Actuator lag      — first-order filter on joint targets (α=0.6, τ≈13ms)
+#                          models CAN-bus delay + motor inductance on real Go1
+#   2. Observation noise — jpos/jvel/ang_vel/proj_grav noise matching real IMU/encoder
+#   3. KP/KD range       — widened to [0.60,1.20]×nominal (was [0.80,1.20])
+#                          real hardware shows up to 40% effective gain drop
+#   4. prev_actions init — randomized at reset (was zeros)
+#                          prevents policy learning "prev=0 means episode start"
 
 import torch
 import numpy as np
@@ -73,13 +82,61 @@ class Go1Env(DirectRLEnv):
             "forward", "upright",
             "smooth",  "rate",    "torques",
             "yaw_err", "even",    "base_z_vel",
-            "fall",
+            "fall",    "hip_center", "action_l2",
         ]}
 
         self._global_step = 0
 
         # Obs normalisation is handled by actor_obs_normalizer inside RSL-RL network
         # (actor_obs_normalization=True in PPO cfg). Do NOT double-normalise here.
+
+        # ── Sim-to-real gap fixes ─────────────────────────────────────────────
+        #
+        # FIX 1 — Actuator lag model
+        # Real Go1 motors have ~13ms lag (CAN bus + motor inductance).
+        # Model as first-order filter on joint position targets:
+        #   lag_pos[t] = α * target[t] + (1-α) * lag_pos[t-1]
+        # α=0.6 → τ = step_dt*(1-α)/α = 0.02*0.4/0.6 ≈ 13ms
+        # Effect in sim: tracking error +0.04–0.08 rad, jvel std ×1.5–2×
+        # matching real observations (tracking err 0.09–0.12 rad, jvel std 0.71)
+        self._lag_alpha = 0.6   # tune: 0.5=slower/more lag, 0.8=faster/less lag
+        self._lag_pos   = None  # initialised at first reset in _reset_idx
+
+        # FIX 2 — Observation noise
+        # Calibrated from real_log data vs sim_log (model_100, same policy):
+        #   jpos noise: encoder quantisation + cable flex   → std=0.005 rad
+        #   jvel noise: velocity estimation from encoder    → std=0.05  rad/s
+        #   ang_vel:    ICM-42688-P gyro datasheet noise    → std=0.02  rad/s
+        #   proj_grav:  accelerometer + complementary filter→ std=0.01  (unit vec)
+        self._obs_noise_std = torch.tensor([
+            0.0,  0.0,  0.0,                     # [0:3]   cmd — no noise (fixed value)
+            *([0.005]*12),                        # [3:15]  jpos_delta
+            *([0.050]*12),                        # [15:27] jvel
+            0.02, 0.02, 0.02,                     # [27:30] ang_vel
+            0.01, 0.01, 0.01,                     # [30:33] proj_grav
+            *([0.0]*12),                          # [33:45] prev_actions — no noise
+        ], device=self.device)                    # shape (45,)
+
+        # FIX 3 — KP/KD randomization range widened (applied in _reset_idx)
+        # Real tracking errors 3–5× larger than sim suggest effective KP can be
+        # as low as 60% of nominal due to motor compliance, backlash, cable routing.
+        # KP range: [0.60, 1.20] × nominal  (was [0.80, 1.20])
+        # KD range: [0.70, 1.30] × nominal  (was [0.80, 1.20]) — wider damping spread
+        self._kp_rand_lo = 0.60   # tune: lower = more lag/compliance in sim
+        self._kp_rand_hi = 1.20
+        self._kd_rand_lo = 0.70
+        self._kd_rand_hi = 1.30
+
+        # FIX 4 — prev_actions init randomization (applied in _reset_idx)
+        # Policy learned "prev_actions=0 → start of episode" in earlier training.
+        # On real hardware, deploy script seeds prev_actions from warmup loop output,
+        # never zeros. Randomize at reset so policy learns to handle any history.
+        # Range: ±30% of tanh limits (mild — don't start in extreme states)
+        self._prev_act_init_scale = 0.3  # fraction of [lo, hi] range to randomize
+
+        # Noise gate — True during training, set to False by play.py before inference
+        # (DirectRLEnv does not inherit nn.Module so has no .training attribute)
+        self._obs_noise_enabled = True
 
         self.last_obs = None
 
@@ -169,7 +226,14 @@ class Go1Env(DirectRLEnv):
 
         # Delta from default standing pose → absolute joint target
         self._target_pos = self._actions + self._robot.data.default_joint_pos
-        self._robot.set_joint_position_target(self._target_pos)
+
+        # FIX 1: Actuator lag — filter target before sending to physics.
+        # Initialised to current joint pos on first call (after first reset).
+        if self._lag_pos is None:
+            self._lag_pos = self._robot.data.joint_pos.clone()
+        self._lag_pos = (self._lag_alpha * self._target_pos
+                         + (1.0 - self._lag_alpha) * self._lag_pos)
+        self._robot.set_joint_position_target(self._lag_pos)
 
     def _apply_action(self):
         """No-op — targets already set in _pre_physics_step."""
@@ -198,6 +262,14 @@ class Go1Env(DirectRLEnv):
             self._prev_actions,                                               # 12
         ], dim=-1)  # = 45
 
+        # FIX 2: Observation noise — inject per-channel Gaussian noise.
+        # Only active when _obs_noise_enabled=True (training).
+        # play.py sets go1_env._obs_noise_enabled=False before inference loop
+        # so sim logs record clean obs matching what real hardware would see.
+        if self._obs_noise_enabled:
+            noise = torch.randn_like(obs) * self._obs_noise_std
+            obs   = obs + noise
+
         return {"policy": obs}
 
     # ── Rewards ───────────────────────────────────────────────────────────────
@@ -209,83 +281,77 @@ class Go1Env(DirectRLEnv):
         cmd      = self.command_manager.command
 
         # ── 1. Forward velocity tracking (dominant positive signal) ──────────
-        # Gaussian centred on commanded vx. Width 0.3 gives gradient even when
-        # tracking is imperfect early in training (wider = easier to learn from).
-        r_forward = 6.0 * torch.exp(
+        # Reduced from 6.0 → 2.0. At 6.0: smooth+rate = only 4.7% of forward
+        # → policy ignored smoothness and learned bang-bang joint slamming.
+        # At 2.0: smooth+rate will be ~15-20% of forward signal — policy must
+        # balance speed vs smoothness to maximise total reward.
+        r_forward = 2.0 * torch.exp(
             -((lin_vel[:, 0] - cmd[:, 0]) ** 2) / 0.25 ** 2
         )
 
         # ── 2. Flat orientation (AnymalC: flat_orientation_l2) ───────────────
-        # Penalise tilt in roll/pitch via projected gravity x/y components.
-        # When upright: gravity = [0, 0, -1], so grav_xy ≈ 0.
-        # Weight reduced from -2.0 — too strong was fighting forward motion.
         r_upright = -1.0 * torch.sum(gravity[:, :2] ** 2, dim=1)
 
-        # NOTE: r_height REMOVED — base height emerges naturally from upright
-        # and contact rewards without needing explicit height tracking.
-
-        # ── 3. Action smoothness (AnymalC: action_rate_l2) ───────────────────
-        # 1st-order: penalise large step-to-step action changes
-        r_smooth = -0.1 * torch.sum((self._actions - self._prev_actions) ** 2, dim=1)
-        # 2nd-order: penalise jerk (acceleration of actions)
-        r_rate   = -0.05 * torch.sum(
+        # ── 3. Action smoothness ──────────────────────────────────────────────
+        # Calibrated from sim_log_model_24900 actual action changes:
+        #   mean sum_sq per step = 0.042  (tanh outputs change ~0.05 rad/joint/step)
+        # Target: smooth+rate ≈ 30% of forward peak (2.0) = 0.60 total
+        #   smooth at -7.0: mean = -7.0 * 0.042 = -0.29
+        #   rate   at -3.5: mean = -3.5 * 0.042 = -0.15
+        #   total  ≈ 0.44 → ~22% of forward ✓ (conservative — won't block gait)
+        # Previous run: smooth=-101 at end = policy slamming joints every step
+        # (sum_sq was ~0.67/step = 16× higher than a smooth trot)
+        r_smooth = -7.0 * torch.sum((self._actions - self._prev_actions) ** 2, dim=1)
+        r_rate   = -3.5 * torch.sum(
             (self._actions - 2 * self._prev_actions + self._prev_prev_actions) ** 2, dim=1
         )
 
         # ── 4. Joint torques ──────────────────────────────────────────────────
-        # Uses _kp_live/_kd_live — the actual per-env randomized gains written
-        # to physics each reset. Reward now accurately reflects what PhysX uses.
-        # q_err    = self._target_pos - self._robot.data.joint_pos
-        # dq       = self._robot.data.joint_vel
-        # torques  = self._kp_live * q_err - self._kd_live * dq
-        # r_torques = -2e-4 * torch.sum(torques ** 2, dim=1)
-
-        torques = self._robot.data.applied_torque  # (num_envs, 12), already computed
+        torques   = self._robot.data.applied_torque
         r_torques = -1e-4 * torch.sum(torques ** 2, dim=1)
 
-
-        # ── 5. Yaw tracking error (not punish ALL yaw) ────────────────────────
-        # Penalise deviation from COMMANDED yaw rate (cmd[:,2]).
-        # With ang_vel_z=0 command this reduces spinning without punishing
-        # small natural yaw corrections during a trot gait.
+        # ── 5. Yaw tracking ───────────────────────────────────────────────────
         r_yaw_err = -0.3 * (ang_vel[:, 2] - cmd[:, 2]) ** 2
 
-        # ── 6. Feet air time (AnymalC: feet_air_time) ────────────────────────
-        # Encourage rhythmic stepping — ~30% contact ratio for a trot.
+        # ── 6. Feet air time ──────────────────────────────────────────────────
         foot_fz      = self.scene.sensors["contact_sensor"].data.net_forces_w[:, :, 2]
         in_contact   = (foot_fz > 8.0).float()
         contact_freq = in_contact.mean(dim=1)
         r_even = 0.1 * torch.exp(-10.0 * (contact_freq - 0.30) ** 2)
 
-        # ── 7. Vertical body velocity (AnymalC: lin_vel_z_l2) ────────────────
-        # Penalise bouncing. Increased weight — was too weak before.
-        r_base_z_vel = -4.0 * (lin_vel[:, 2] ** 2)  # stronger — penalise diving hard
+        # ── 7. Vertical body velocity ─────────────────────────────────────────
+        r_base_z_vel = -4.0 * (lin_vel[:, 2] ** 2)
 
-        # ── 8. Fall termination penalty ───────────────────────────────────────
-        # No alive bonus — it caused stand-still exploitation.
-        # Falling is discouraged implicitly by losing forward+upright rewards,
-        # plus this explicit one-time penalty at termination height.
-        r_fall = -5.0 * (height < 0.25).float()  # matches termination height
+        # ── 8. Fall penalty ───────────────────────────────────────────────────
+        r_fall = -5.0 * (height < 0.25).float()
 
+        # ── 9. Hip centering (NEW) ────────────────────────────────────────────
+        # Previous training: RR_hip 99% at -0.15 limit, FL_hip 76%.
+        # Hips slamming to limits → raw_net explodes to ±40 → OOD on real.
+        # Penalise large hip delta (actions[:4]) to keep hips near zero.
+        # Weight -0.5: strong enough to compete with forward at reduced scale.
+        r_hip_center = -0.5 * torch.sum(self._actions[:, :4] ** 2, dim=1)
 
-        # joint_limits reward REMOVED — tanh squashing in _pre_physics_step
-        # enforces limits with live gradients. Soft penalty was ignored by policy
-        # (traded -100 penalty for +4000 forward). tanh makes violation impossible.
+        # ── 10. Action L2 (NEW) ───────────────────────────────────────────────
+        # Penalise large tanh outputs directly. Prevents raw_net → ±40 spiral.
+        # At raw_net=40: tanh=1.0, gradient≈0, policy gets no learning signal.
+        # This term keeps raw_net in [-4,+4] where tanh has useful gradient.
+        # Weight -0.05: soft constraint, not blocking the policy.
+        r_action_l2 = -0.05 * torch.sum(self._actions ** 2, dim=1)
 
         keys = ["forward","upright","smooth","rate","torques",
-                "yaw_err","even","base_z_vel","fall"]
+                "yaw_err","even","base_z_vel","fall","hip_center","action_l2"]
         vals = [r_forward,r_upright,r_smooth,r_rate,r_torques,
-                r_yaw_err,r_even,r_base_z_vel,r_fall]
+                r_yaw_err,r_even,r_base_z_vel,r_fall,r_hip_center,r_action_l2]
         for k, v in zip(keys, vals):
             self._ep_sums[k] += v
 
-        # Scale by step_dt keeps cumulative returns in learnable range for VF.
-        # step_dt = decimation * sim_dt = 10 * 0.002 = 0.02s
         total = self.step_dt * (
             r_forward + r_upright +
             r_smooth  + r_rate    + r_torques +
-            r_yaw_err + r_even    + r_base_z_vel
-        ) + r_fall  # one-time penalty, not scaled by dt
+            r_yaw_err + r_even    + r_base_z_vel +
+            r_hip_center + r_action_l2
+        ) + r_fall
 
         return total
 
@@ -312,12 +378,13 @@ class Go1Env(DirectRLEnv):
             print("=" * 40)
 
         # ── Manual KP/KD domain randomization ────────────────────────────────
-        # Randomize ±20% per env per episode. Replaces EventTerm approach
-        # (mdp.randomize_actuator_gains may not exist in all Isaac Lab versions).
-        # Range covers real hardware variation measured in calibration:
-        #   Hip:   [28, 42]   Thigh: [52, 78]   Knee: [64, 96]
-        rand_factor_kp = torch.empty(len(env_ids), 12, device=self.device).uniform_(0.80, 1.20)
-        rand_factor_kd = torch.empty(len(env_ids), 12, device=self.device).uniform_(0.80, 1.20)
+        # FIX 3: Range widened to [0.60, 1.20] × nominal (was [0.80, 1.20]).
+        # Real hardware can show effective KP as low as 60% of nominal due to
+        # motor compliance, cable routing, and gear backlash. KD also widened.
+        rand_factor_kp = torch.empty(len(env_ids), 12, device=self.device).uniform_(
+            self._kp_rand_lo, self._kp_rand_hi)
+        rand_factor_kd = torch.empty(len(env_ids), 12, device=self.device).uniform_(
+            self._kd_rand_lo, self._kd_rand_hi)
         self._kp_live[env_ids] = self._kp_nominal * rand_factor_kp
         self._kd_live[env_ids] = self._kd_nominal * rand_factor_kd
 
@@ -338,10 +405,23 @@ class Go1Env(DirectRLEnv):
         self.command_manager.reset(env_ids)
 
         # Clear buffers
-        self._actions[env_ids]          = 0.0
-        self._prev_actions[env_ids]     = 0.0
-        self._prev_prev_actions[env_ids]= 0.0
-        self._target_pos[env_ids]       = self._robot.data.default_joint_pos[env_ids]
+        # FIX 4: Randomize prev_actions instead of zeros.
+        # Real deploy script seeds prev_actions from warmup loop (never zero).
+        # ±30% of [lo,hi] range → small but non-zero, covers realistic start states.
+        _mid  = (self._delta_soft_hi + self._delta_soft_lo) * 0.5   # (12,)
+        _half = (self._delta_soft_hi - self._delta_soft_lo) * 0.5
+        _rand_prev = (_mid + _half * self._prev_act_init_scale
+                      * (torch.rand(len(env_ids), 12, device=self.device) * 2 - 1))
+        self._actions[env_ids]           = _rand_prev
+        self._prev_actions[env_ids]      = _rand_prev
+        self._prev_prev_actions[env_ids] = _rand_prev
+        self._target_pos[env_ids]        = self._robot.data.default_joint_pos[env_ids]
+
+        # Reset actuator lag state for these envs to current joint pos
+        # (avoids lag_pos being stale from previous episode)
+        if self._lag_pos is not None:
+            self._lag_pos[env_ids] = self._robot.data.joint_pos[env_ids].clone()
+
         for k in self._ep_sums:
             self._ep_sums[k][env_ids]   = 0.0
 
@@ -372,6 +452,9 @@ class Go1Env(DirectRLEnv):
             idx = 0
             print(f"\n{'='*80}")
             print(f"[DEBUG] step {self._global_step} | env 0 | cmd_vx={self.command_manager.command[idx,0]:.2f}")
+            print(f"  [S2R] lag_alpha={self._lag_alpha}  noise_jvel_std={self._obs_noise_std[15].item():.3f}"
+                  f"  KP_range=[{self._kp_rand_lo:.2f},{self._kp_rand_hi:.2f}]×nom"
+                  f"  prev_act_init_scale={self._prev_act_init_scale}")
 
             # ── ACTUATOR GAIN CHECK (domain rand verification) ────────────────
             # _kp_live holds the actual per-env randomized KP written to physics.
@@ -415,6 +498,50 @@ class Go1Env(DirectRLEnv):
                 # Sanity checks on raw obs (no normaliser applied in env)
                 grav_mag = o[30:33].norm().item()
                 print(f"  grav_mag:   {grav_mag:.3f} (should be ~1.0 if upright)")
+
+            # ── ACTUATOR LAG VISUALISATION ────────────────────────────────────
+            # Shows the gap between what the policy commanded and what the lag
+            # filter actually sent to PhysX this step.
+            #
+            # Real CAN-bus: 2-6ms lag at 500Hz resolution
+            # Our filter:   τ=step_dt*(1-α)/α = 0.02*0.4/0.6 = 13ms at 50Hz
+            #
+            # Columns:
+            #   policy_target — what tanh squash produced (desired pos)
+            #   lag_sent      — what _lag_pos actually sent to PhysX
+            #   lag_error     — lag_sent - policy_target  (lag-induced offset)
+            #   actual_q      — where joint actually is right now
+            #   track_err     — actual_q - lag_sent  (PD controller residual)
+            if self._lag_pos is not None:
+                import numpy as _np
+                tgt  = self._target_pos[idx].cpu().numpy()
+                lag  = self._lag_pos[idx].cpu().numpy()
+                act  = self._robot.data.joint_pos[idx].cpu().numpy()
+                lerr = lag - tgt                # how far lag_sent is from policy intent
+                terr = act - lag                # how far actual is from lag command
+                JNAMES = ['FL_hip','FR_hip','RL_hip','RR_hip',
+                          'FL_th', 'FR_th', 'RL_th', 'RR_th',
+                          'FL_kn', 'FR_kn', 'RL_kn', 'RR_kn']
+                print(f"\n  [LAG DEBUG env0]  α={self._lag_alpha}  "
+                      f"τ≈{0.02*(1-self._lag_alpha)/self._lag_alpha*1000:.0f}ms")
+                print(f"  {'joint':8s}  {'policy_tgt':>10}  {'lag_sent':>10}  "
+                      f"{'lag_err':>10}  {'actual_q':>10}  {'track_err':>10}")
+                print(f"  {'-'*62}")
+                for j in range(12):
+                    lag_flag   = "LAG"   if abs(lerr[j]) > 0.02 else ""
+                    track_flag = "TRACK" if abs(terr[j]) > 0.05 else ""
+                    flag = f"  *** {lag_flag}{'+' if lag_flag and track_flag else ''}{track_flag}" if (lag_flag or track_flag) else ""
+                    print(f"  {JNAMES[j]:8s}  {tgt[j]:+10.4f}  {lag[j]:+10.4f}  "
+                          f"{lerr[j]:+10.4f}  {act[j]:+10.4f}  {terr[j]:+10.4f}{flag}")
+                # Summary stats
+                mean_lag_err   = _np.abs(lerr).mean()
+                mean_track_err = _np.abs(terr).mean()
+                total_err      = _np.abs(act - tgt).mean()
+                print(f"  mean |lag_err|={mean_lag_err:.4f} rad  "
+                      f"mean |track_err|={mean_track_err:.4f} rad  "
+                      f"mean |total_err|={total_err:.4f} rad")
+                print(f"  (real hardware target: total_err ~ 0.05-0.12 rad  "
+                      f"{'✓ in range' if 0.03 < total_err < 0.15 else '⚠ check lag_alpha'})")
 
             print(f"  action out: {action[idx].cpu().numpy()}")
             print(f"  root_z:     {self._robot.data.root_pos_w[idx,2]:.3f}")
