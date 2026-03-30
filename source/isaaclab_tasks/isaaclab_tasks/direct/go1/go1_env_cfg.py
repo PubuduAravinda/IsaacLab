@@ -1,7 +1,10 @@
-# go1_env_cfg.py
-# Flat terrain only. 45D obs (no foot contacts). 50Hz policy (decimation=10).
-# Keeps identical @configclass pattern as original working file.
-# To change num_envs: edit the class-level field below — do NOT patch at runtime.
+# go1_env_cfg.py  — v3
+# Flat terrain. 45D obs. 50Hz policy (decimation=10).
+# Changes from v2:
+#   - EventCfg: terrain_friction added (DR [0.4,1.2]) — covers real floor μ≈0.5-0.6
+#   - EventCfg: randomize_actuator_gains removed — go1_env.py handles KP DR
+#     per joint type (hips/thighs [0.40,1.20], knees [0.60,1.20])
+#   - knee init_state kept at -1.5 (reverted from -1.3 which caused over-extension)
 
 import isaaclab.envs.mdp as mdp
 import isaaclab.sim as sim_utils
@@ -22,9 +25,18 @@ from isaaclab.actuators import ImplicitActuatorCfg
 
 @configclass
 class EventCfg:
-    """Friction DR + actuator gain DR — matches real Go1 hardware variation."""
+    """Friction DR for robot body + feet — covers real floor variation.
 
-    physics_material = EventTerm(
+    Actuator gain DR is handled in go1_env.py _reset_idx() per-joint-type.
+
+    NOTE: ground plane is an XFormPrim — Isaac Lab cannot apply
+    randomize_rigid_body_material to it. Instead we randomize the robot's
+    foot friction each episode, which achieves the same physics effect:
+    lower foot friction = more slip = same forward pitch as on real floor μ≈0.5-0.6.
+    """
+
+    # Robot body friction at startup — baseline for all body links
+    robot_friction = EventTerm(
         func=mdp.randomize_rigid_body_material,
         mode="startup",
         params={
@@ -36,24 +48,20 @@ class EventCfg:
         },
     )
 
-    # Actuator gain randomization — per-episode (mode="reset").
-    # Scales nominal KP/KD by a uniform random factor each episode.
-    # Range ±20% deliberately spans the real hardware variation:
-    #   Hip:   [30, 40]  — real hips measured 35-40 across runs
-    #   Thigh: [52, 78]  — FL/FR actual=49, RL/RR actual=70 → both inside range
-    #   Knee:  [64, 96]  — all 4 knees at 80 ceiling, ±20% covers wear variation
-    # Policy trained across this range learns to handle all leg states on this robot.
-    randomize_actuator_gains = EventTerm(
-        func=mdp.randomize_actuator_gains,
+    # Foot friction DR every episode — simulates different floor surfaces.
+    # Real floor μ≈0.5-0.6, sim default=1.0. Randomizing foot friction
+    # [0.4,1.2] makes policy learn to handle slippery floors, preventing
+    # the over-push that caused persistent grav_x≈+0.08 on real hardware.
+    # body_names=".*foot" targets only the 4 foot links, not the whole body.
+    foot_friction = EventTerm(
+        func=mdp.randomize_rigid_body_material,
         mode="reset",
         params={
-            "asset_cfg": SceneEntityCfg(
-                "robot",
-                joint_names=[".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"],
-            ),
-            "stiffness_distribution_params": (0.80, 1.20),  # uniform mult factor
-            "damping_distribution_params":   (0.80, 1.20),
-            "operation": "scale",
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*foot"),
+            "static_friction_range":  (0.5, 1.1),
+            "dynamic_friction_range": (0.4, 0.9),
+            "restitution_range":      (0.0, 0.05),
+            "num_buckets": 16,
         },
     )
 
@@ -64,7 +72,7 @@ class Go1SceneCfg(InteractiveSceneCfg):
 
     ground = AssetBaseCfg(
         prim_path="/World/ground",
-        spawn=sim_utils.GroundPlaneCfg(size=(400.0, 400.0)),  # big enough for 4096 envs @ 4m spacing
+        spawn=sim_utils.GroundPlaneCfg(size=(400.0, 400.0)),
     )
 
     light = AssetBaseCfg(
@@ -80,17 +88,17 @@ class Go1SceneCfg(InteractiveSceneCfg):
             joint_pos={
                 ".*_hip_joint":   0.1,
                 ".*_thigh_joint": 0.8,
-                ".*_calf_joint":  -1.5,
+                ".*_calf_joint":  -1.5,   # keep at -1.5 (reverted from -1.3)
+                                           # knee init=-1.3 caused over-extension
+                                           # (policy extends +0.35 → target=-0.95,
+                                           #  nearly straight. -1.5 gives -1.15 target
+                                           #  which matches real hardware actual)
             },
         ),
         actuators={
-            # Per-type KP/KD — derived from real Go1 hardware calibration.
-            # Values match what real motors actually need to hold position.
-            # Domain randomization scales these ±20% per episode (see EventCfg).
-            #
-            # Hip:   KP=35 KD=4.0  — converged cleanly at this gain, no overdrive
-            # Thigh: KP=65 KD=4.5  — center of FL/FR=49 and RL/RR=70 measured range
-            # Knee:  KP=80 KD=5.0  — all 4 knees needed KP=80 ceiling to hold pose
+            # Nominal KP/KD — go1_env.py applies per-joint DR ranges each episode:
+            #   hips/thighs: [0.40,1.20]×nom — covers noisy FR motor (47% nominal)
+            #   knees:       [0.60,1.20]×nom — prevents sim knee lag > real hardware
             "hip_joints": ImplicitActuatorCfg(
                 joint_names_expr=[".*_hip_joint"],
                 stiffness=35.0,
@@ -112,7 +120,6 @@ class Go1SceneCfg(InteractiveSceneCfg):
         },
     )
 
-    # Used only in r_even reward — NOT in observations (real Go1 has no foot sensors)
     contact_sensor = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/.*_foot",
         update_period=0.005,
@@ -125,30 +132,25 @@ class Go1SceneCfg(InteractiveSceneCfg):
 @configclass
 class Go1FlatEnvCfg(DirectRLEnvCfg):
     """
-    Flat terrain env. 45-D obs. 50 Hz policy.
+    Flat terrain env. 45-D obs. 50Hz policy.
 
-    Obs layout (45-D — all readable from real Go1 hardware):
+    Obs layout (45-D):
         [0:3]   velocity commands (vx, vy, wz)
-        [3:15]  joint pos delta from default        (encoders)
-        [15:27] joint velocity                      (encoders)
-        [27:30] base angular velocity               (IMU gyro)
-        [30:33] projected gravity                   (IMU orientation)
-        [33:45] previous actions                    (buffer)
+        [3:15]  joint pos delta from default (encoders)
+        [15:27] joint velocity               (encoders)
+        [27:30] base angular velocity        (IMU gyro)
+        [30:33] projected gravity            (IMU orientation)
+        [33:45] previous actions             (buffer)
 
-    No foot contacts — real Go1 has no foot force sensors.
-
-    IMPORTANT: @configclass bakes scene(num_envs, env_spacing) at import time.
-    Change num_envs / env_spacing HERE in the class body — do NOT patch scene
-    attributes at runtime. For play, pass --num_envs 1 and the cfg default
-    is overridden safely because play.py rebuilds a fresh Go1FlatEnvCfg().
+    IMPORTANT: @configclass bakes scene(num_envs) at import time.
+    Edit num_envs here — do NOT patch at runtime.
     """
 
     episode_length_s = 20.0
-    decimation       = 10       # 500 Hz / 10 = 50 Hz policy — matches real Go1 SDK
+    decimation       = 10       # 500 Hz / 10 = 50 Hz
 
-    # ── Set training scale here ───────────────────────────────────────────────
-    num_envs    = 1000# 4096   # reduce to 500 if VRAM limited
-    env_spacing = 4.0    # 4 m spacing → clean grid at 4096 envs (64×64)
+    num_envs    = 1000  # reduce to 500 if VRAM limited
+    env_spacing = 4.0
 
     observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(45,), dtype=np.float32)
     action_space      = spaces.Box(low=-1.0,    high=1.0,    shape=(12,), dtype=np.float32)
@@ -156,10 +158,10 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
 
     commands = mdp.commands.UniformVelocityCommandCfg(
         asset_name="robot",
-        resampling_time_range=(5.0, 10.0),  # long enough to build momentum
+        resampling_time_range=(5.0, 10.0),
         debug_vis=False,
         ranges=mdp.commands.UniformVelocityCommandCfg.Ranges(
-            lin_vel_x=(0.3, 0.9),            # slow walk only — learn stability first
+            lin_vel_x=(0.3, 0.9),
             lin_vel_y=(0.0, 0.0),
             ang_vel_z=(0.0, 0.0),
             heading=(-np.pi / 8, np.pi / 8),
@@ -183,7 +185,7 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
         terrain_type="plane",
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
-            static_friction=0.7,
+            static_friction=0.7,    # starting value — terrain_friction DR overrides per episode
             dynamic_friction=0.7,
             restitution=0.0,
         ),
