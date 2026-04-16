@@ -38,7 +38,7 @@ class Go1RslRlPpoCfg(RslRlOnPolicyRunnerCfg):
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,                      # standard PPO clip
-        entropy_coef=0.005,                   # Balanced — prevents collapse without over-randomising
+        entropy_coef=0.001,                   # Balanced — prevents collapse without over-randomising
         num_learning_epochs=5,
         num_mini_batches=4,                  # Good balance with large env count
         learning_rate=1.0e-3,
@@ -46,7 +46,7 @@ class Go1RslRlPpoCfg(RslRlOnPolicyRunnerCfg):
         gamma=0.99,
         lam=0.95,
         desired_kl=0.01,
-        max_grad_norm=1.0,                  # Paper clipping
+        max_grad_norm=0.5,                  # Paper clipping
     )
 
 

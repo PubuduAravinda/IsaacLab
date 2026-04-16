@@ -24,6 +24,10 @@ parser.add_argument("--log",          action="store_true", default=False,
                     help="Save sim_log_<checkpoint>_<ts>.npz for sim-real comparison")
 parser.add_argument("--log_steps",    type=int, default=1500,
                     help="Steps to record when --log is set (default 1500 = 30s at 50Hz)")
+parser.add_argument("--phase2",       action="store_true", default=False,
+                    help="Force Phase 2 delay DR U[0,8] per episode. REQUIRED for correct "
+                         "evaluation of policies trained past _DELAY_PHASE1_END (step 15000). "
+                         "Without this, delay=0 (Phase 1) — wrong conditions for Phase 2 policy.")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -191,9 +195,46 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
     elif args_cli.log:
         print("[LOG] WARNING: could not find actor output layer — raw_net will be zeros")
 
-    # ── Inference loop ────────────────────────────────────────────────────────
-    # Disable obs noise — play.py runs clean inference (noise is training-only)
-    go1_env._obs_noise_enabled = False
+    # ── Force training conditions ────────────────────────────────────────────
+    # Policy was trained with:
+    #   (a) obs noise ON  — do NOT disable, or distribution shift corrupts inference
+    #   (b) Phase 2 delay DR (U[0,8]) — set _global_step to trigger Phase 2
+    # go1_env._obs_noise_enabled = False  ← REMOVED: disabling noise is wrong for eval
+    go1_env._obs_noise_enabled = True   # match training exactly
+
+    if args_cli.phase2:
+        from isaaclab_tasks.direct.go1.go1_env import _DELAY_PHASE1_END
+        go1_env._global_step = _DELAY_PHASE1_END
+        # Force immediate delay sampling — don't wait for first episode end
+        all_envs = torch.arange(go1_env.num_envs, device=go1_env.device)
+        go1_env._env_delays = torch.randint(
+            0, 8 + 1, (go1_env.num_envs,),
+            device=go1_env.device, dtype=torch.long)
+        print(f"[PLAY] Delays pre-sampled: mean={go1_env._env_delays.float().mean():.1f} "
+              f"env0={go1_env._env_delays[0].item()} steps")
+    else:
+        print("[PLAY] WARNING: --phase2 not set → delay=0ms (Phase 1).")
+        print("         Policy trained in Phase 2 (16ms DR) will be evaluated under")
+        print("         wrong conditions. Use --phase2 for correct evaluation.")
+
+    # ── Action range verification (printed before inference starts) ───────────
+    print("[PLAY] Action range verification (must match go1_deploy.py):")
+    lo = go1_env._delta_soft_lo.cpu().numpy()
+    hi = go1_env._delta_soft_hi.cpu().numpy()
+    JNAMES = ["FL_hip","FR_hip","RL_hip","RR_hip",
+              "FL_th","FR_th","RL_th","RR_th",
+              "FL_kn","FR_kn","RL_kn","RR_kn"]
+    print(f"  {'Joint':<10} {'lo':>7} {'hi':>7} {'mid':>7} {'half':>7}")
+    for i, n in enumerate(JNAMES):
+        mid  = (hi[i]+lo[i])/2
+        half = (hi[i]-lo[i])/2
+        print(f"  {n:<10} {lo[i]:>7.3f} {hi[i]:>7.3f} {mid:>7.3f} {half:>7.3f}")
+    print()
+    print("  [Deploy mapping] go1_deploy.py THIGH_SCALE=0.95, KNEE_SCALE=0.95, HIP_SCALE=0.70")
+    print("  Max thigh hw delta = 0.35 × 0.95 = 0.332 rad (within Go1 URDF limits ✓)")
+    print("  Max knee  hw delta = 0.35 × 0.95 = 0.332 rad (within Go1 URDF limits ✓)")
+    print()
+
     policy   = runner.get_inference_policy(device=env.unwrapped.device)
     dt       = env.unwrapped.step_dt
     obs      = env.get_observations()
