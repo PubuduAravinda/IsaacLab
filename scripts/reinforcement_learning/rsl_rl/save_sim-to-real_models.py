@@ -48,7 +48,7 @@ import numpy as np
 # CONFIGURE: point to the checkpoint you want to deploy
 # ─────────────────────────────────────────────────────────────────────────────
 CHECKPOINT = (
-    "/home/sripu715/IsaacLab/scripts/reinforcement_learning/rsl_rl/logs/rsl_rl/go1_himloco/2026-04-15_14-38-00/model_22700.pt"
+    "/home/sripu715/IsaacLab/scripts/reinforcement_learning/rsl_rl/logs/rsl_rl/go1_himloco/2026-04-17_12-19-24/model_24600.pt"
 )
 OUTPUT_DIR = os.path.join(os.path.dirname(CHECKPOINT), "go1_deploy")
 

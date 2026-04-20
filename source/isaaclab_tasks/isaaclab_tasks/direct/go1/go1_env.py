@@ -1,4 +1,4 @@
-# go1_env.py — Final: FR_th Position Cap + Full PACE + Confirmed Rewards
+# go1_env.py — v4: Hip±0.08 + FR_th Cap + RL_th Stochastic DR + HipReg
 #
 # ┌─────────────────────────────────────────────────────────────────────────┐
 # │ CALIBRATION STATUS (from PACE run 26_04_02_12-07-29 + manual tests)    │
@@ -43,7 +43,7 @@ class Go1Env(DirectRLEnv):
         super().__init__(cfg, render_mode, **kwargs)
 
         print("\n" + "="*72)
-        print("Go1Env | Final: FR_th Cap + Full PACE + Velocity-Gated Alive")
+        print("Go1Env | v4: Hip±0.08 + FR_th≤0.820 + RL_th StochDR U[0,1] + HipReg")
         print("  RL_th: Kim masking p=0.10  τf=4.944 Nm  d=3.459 Nm·s/rad")
         print("  FR_th: position cap max=default+0.07=0.87 rad (binding fault)")
         print("  r_alive: 0.3 × clamp(vx/0.2,0,1)  [A/B=0.55 no exploit]")
@@ -114,7 +114,11 @@ class Go1Env(DirectRLEnv):
         # Cap at 0.07 rad above default (0.800) = 0.870 rad max target.
         # This is a POSITION LIMIT on the commanded target, not KP masking.
         # PD controller remains active — joint is functional, just range-limited.
-        self._fr_th_max_delta = 0.02   # rad above default → max target = 0.870
+        # FR_th cap: 0.07 → 0.02 rad (v3 real-robot fix)
+        # Training cap 0.870 + 1.4× real overshoot → actual 1.22 rad → binding zone
+        # Tightening to 0.020 → max target 0.820 (= deploy clamp exactly)
+        # Real overshoot: 0.820 × 1.4 = 0.868 → stays below 0.900 binding ✓
+        self._fr_th_max_delta = 0.02   # rad above default → max target = 0.820
         # FR_th is Isaac index 5
         # In _pre_physics_step: cmd_to_send[:,5] clamped to ≤ default+0.07
 
@@ -144,23 +148,37 @@ class Go1Env(DirectRLEnv):
         self._kd_dr_kn_lo     = 0.80;  self._kd_dr_kn_hi     = 1.20
 
         # Hip rate weight 1.5 — suppresses 5-8Hz hip oscillation confirmed in real logs
+        # Thigh rate weight: 0.620 → 0.900 (real-to-sim gap fix v2)
+        # Real robot thighs oscillated at 4.7-10.4Hz vs sim 2-3Hz target.
+        # Root: real joint inertia + 16ms delay creates resonance above 5Hz BW.
+        # 1.45× heavier thigh jerk penalty pushes trained gait toward 5-6Hz.
+        # NOT increased to 1.0+ (risks over-smoothing → shuffle gait).
+        # r_action_rate kept at -1.0 — this weight increase IS the jerk fix.
         self._rate_weights = torch.tensor([
-            1.500, 1.500, 1.500, 1.500,   # hips   BW=3.1Hz
-            0.620, 0.620, 0.620, 0.620,   # thighs BW=5.0Hz
-            0.564, 0.564, 0.564, 0.564,   # calves BW=5.5Hz
+            1.500, 1.500, 1.500, 1.500,   # hips   BW=3.1Hz  unchanged
+            0.900, 0.900, 0.900, 0.900,   # thighs BW=5.0Hz  0.620→0.900 ←
+            0.564, 0.564, 0.564, 0.564,   # calves BW=5.5Hz  unchanged
         ], device=self.device)
 
+        # Hip limits: ±0.20 → ±0.08 rad (v3 real-robot fix)
+        # All 3 real runs: policy uses full ±0.20 range → FR_hip splays +0.124 rad
+        # → FR_th overshoot amplified 1.4× by changed kinematic chain → binding
+        # Flat terrain: hips only need ±0.08 rad (4.6°) for lateral stability
+        # KP=35 × 0.08 = 2.8 Nm — well within torque limits, gentle correction
+        # DELTA_LO/HI in go1_deploy.py MUST be updated to match!
         self._delta_soft_lo = torch.tensor(
-            [-0.20, -0.20, -0.25, -0.20,
-             -0.35, -0.35, -0.35, -0.35,
-             -0.35, -0.35, -0.35, -0.35], device=self.device)
+            [-0.08, -0.08, -0.08, -0.08,   # hips: ±0.20 → ±0.08
+             -0.35, -0.35, -0.35, -0.35,   # thighs unchanged
+             -0.35, -0.35, -0.35, -0.35,   # calves unchanged
+            ], device=self.device)
         self._delta_soft_hi = torch.tensor(
-            [ 0.20,  0.20,  0.25,  0.20,
-              0.35,  0.35,  0.35,  0.35,
-              0.35,  0.35,  0.35,  0.35], device=self.device)
+            [ 0.08,  0.08,  0.08,  0.08,   # hips: ±0.20 → ±0.08
+              0.35,  0.35,  0.35,  0.35,   # thighs unchanged
+              0.35,  0.35,  0.35,  0.35,   # calves unchanged
+            ], device=self.device)
 
         _rk = ["lin_vel", "ang_vel", "ang_vel_xy", "lin_vel_z", "torques",
-               "action_rate", "action_jerk", "upright", "trot", "alive", "fall"]
+               "action_rate", "action_jerk", "upright", "trot", "alive", "fall", "hip_reg"]
         self._ep_sums     = {k: torch.zeros(_n, device=self.device) for k in _rk}
 
         # Eval mode: set _global_step to Phase 2 if env var set (play.py --phase2)
@@ -180,7 +198,16 @@ class Go1Env(DirectRLEnv):
             *([0.0] * 12),
         ], device=self.device)
 
-        self._rl_th_mask_prob     = 0.10   # Kim masking: RL_th KP=0 with p=0.10
+        # RL_th: Stochastic execution DR (v4)
+        # Real hardware executes ~72% of commanded RL_th excursion (measured from
+        # uncalibrated walking policy real log: ±0.290 cmd → ±0.208 actual, ratio=0.72)
+        # Kim masking (always 0%) and position cap (always 100%) are both wrong.
+        # Per-episode scale U[0,1]: policy sees full range of RL_th behaviours →
+        # learns to walk robustly when RL_th contributes 0%, 72%, or 100%.
+        # Sampled in _reset_idx, stored in _rl_th_scale [num_envs].
+        # PACE τf=4.944 Nm KEPT in sim — physics remains honest.
+        self._rl_th_scale = torch.ones(self.num_envs, device=self.device)
+        # start at 1.0 (full execution), resampled per episode in _reset_idx
         self._prev_act_init_scale = 0.3
         self._obs_noise_enabled   = True
         self.last_obs = None
@@ -229,6 +256,16 @@ class Go1Env(DirectRLEnv):
         self._actions[:]           = a
         self._target_pos = self._actions + self._robot.data.default_joint_pos
 
+        # ── RL_th stochastic execution DR ─────────────────────────────────────
+        # Real hardware executes ~72% of commanded excursion (measured from
+        # uncalibrated walking policy: ±0.290 cmd → ±0.208 actual, ratio=0.72).
+        # Per-episode _rl_th_scale ~ U[0,1] resampled in _reset_idx.
+        # scale=0.0 = Kim-like, scale=0.72 = real hw, scale=1.0 = perfect sim.
+        # PACE τf=4.944 Nm remains — Coulomb friction still in physics.
+        rl_default   = self._robot.data.default_joint_pos[:, 6]
+        rl_excursion = self._target_pos[:, 6] - rl_default
+        self._target_pos[:, 6] = rl_default + rl_excursion * self._rl_th_scale
+
         # ── FR_th position cap ────────────────────────────────────────────
         # Hard limit: FR_th (Isaac index 5) cannot be commanded above 0.870 rad.
         # This prevents the policy from ever pushing FR_th into the mechanical
@@ -236,7 +273,7 @@ class Go1Env(DirectRLEnv):
         # The policy is trained to walk within this constraint → learns a gait
         # that doesn't require deep FR_th flexion.
         fr_th_max = (self._robot.data.default_joint_pos[:, 5]
-                     + self._fr_th_max_delta)   # [N] = 0.870 rad for all envs
+                     + self._fr_th_max_delta)   # [N] = 0.820 rad for all envs (v3: 0.02 delta)
         self._target_pos[:, 5] = torch.minimum(self._target_pos[:, 5], fr_th_max)
 
         # Delay DR ring buffer (vectorised gather — no Python loop)
@@ -287,8 +324,18 @@ class Go1Env(DirectRLEnv):
         r_lin_vel_z  = -4.0  * lin_vel[:, 2]**2   # bounce suppression (-2→-4)
         r_torques    = -1e-5 * torch.sum(
             self._robot.data.applied_torque**2, dim=1)
-        r_upright    = -2.0  * (gravity[:, 0]**2 + gravity[:, 1]**2)
+        # r_upright: -2.0 → -2.5 (real-to-sim gap fix v2)
+        # Real tilt mean=15.2° vs sim 6.7° — 2.3× higher body rock.
+        # Conservative 25% increase. Oscillation fix (thigh rate weight)
+        # already reduces tilt by ~30% indirectly. Don't over-correct.
+        r_upright    = -2.5  * (gravity[:, 0]**2 + gravity[:, 1]**2)
         r_fall       = -10.0 * (height < 0.25).float()
+
+        # Hip regularisation: keeps hips near default on flat terrain
+        # Flat terrain walking: hips should stay near 0 (no lateral steering needed)
+        # -0.5 × sum(hip_delta²) at hip=±0.08: cost = -0.5 × 0.08² × 4 = -0.013/step
+        # Small enough to not block hip correction, large enough to prefer centred
+        r_hip_reg = -0.5 * torch.sum(self._actions[:, :4]**2, dim=1)
 
         d1 = self._actions - self._prev_actions
         d2 = self._actions - 2*self._prev_actions + self._prev_prev_actions
@@ -298,16 +345,16 @@ class Go1Env(DirectRLEnv):
 
         for k, v in zip(
             ["lin_vel","ang_vel","ang_vel_xy","lin_vel_z","torques",
-             "action_rate","action_jerk","upright","trot","alive","fall"],
+             "action_rate","action_jerk","upright","trot","alive","fall","hip_reg"],
             [r_lin_vel,r_ang_vel,r_ang_vel_xy,r_lin_vel_z,r_torques,
-             r_action_rate,r_action_jerk,r_upright,r_trot,r_alive,r_fall]
+             r_action_rate,r_action_jerk,r_upright,r_trot,r_alive,r_fall,r_hip_reg]
         ):
             self._ep_sums[k] += v
 
         return self.step_dt * (
             r_lin_vel + r_ang_vel + r_ang_vel_xy + r_lin_vel_z
             + r_torques + r_action_rate + r_action_jerk
-            + r_upright + r_trot + r_alive
+            + r_upright + r_trot + r_alive + r_hip_reg
         ) + r_fall
 
     def _get_dones(self):
@@ -358,15 +405,14 @@ class Go1Env(DirectRLEnv):
             self._kd_dr_kn_lo, self._kd_dr_kn_hi)
         actuator.damping[env_ids] = self._kd_nominal.unsqueeze(0) * kd_scale
 
-        # ── Kim masking: RL_th p=0.10 AFTER KP DR ────────────────────────
-        # Models the RL_th stiction fault (τf=4.944 Nm) behaviourally.
-        # p=0.10: 10% of training envs have RL_th completely free (KP=0).
-        # Applied AFTER KP DR so the masking overrides the DR value.
-        mask = torch.rand(n, device=self.device) < self._rl_th_mask_prob
-        if mask.any():
-            masked = env_ids[mask]
-            actuator.stiffness[masked, 6] = 0.0   # RL_th = Isaac index 6
-            self._kp_live[masked, 6]      = 0.0
+        # ── RL_th stochastic execution DR — resample per episode ─────────────
+        # Each episode gets a new U[0,1] scale for ALL envs in env_ids.
+        # scale=0.0 → no RL_th movement (Kim-equivalent for that episode)
+        # scale=0.72 → matches measured real hardware (old walking policy log)
+        # scale=1.0 → perfect execution (sim default)
+        # KP DR still applies normally — full PD controller active.
+        # PACE τf=4.944 Nm remains — physics honest.
+        self._rl_th_scale[env_ids] = torch.rand(n, device=self.device)
 
         # Re-apply RL_th viscous damping (super restores cfg baseline)
         if hasattr(actuator, 'viscous_friction'):
@@ -392,8 +438,8 @@ class Go1Env(DirectRLEnv):
             diff = (abs(actuator.stiffness[0]-actuator.stiffness[1]).max().item()
                     if self.num_envs > 1 else 0.0)
             print(f"  [KP DR]   diff={diff:.1f} {'✓' if diff>2 else '⚠'}")
-            if mask.any():
-                print(f"  [Kim RL_th] {mask.sum().item()} masked of {n}")
+            rl_scale_mean = self._rl_th_scale.mean().item()
+            print(f"  RL_th DR scale: mean={rl_scale_mean:.2f} (0=Kim, 0.72=real, 1=perfect)")
             if hasattr(actuator, 'viscous_friction'):
                 vf6 = actuator.viscous_friction[env_ids[0], 6].item()
                 print(f"  [d RL_th] {vf6:.3f} ({'✓' if abs(vf6-3.459)<0.01 else '⚠'})")
