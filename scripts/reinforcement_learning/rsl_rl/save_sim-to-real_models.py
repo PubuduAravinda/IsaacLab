@@ -48,7 +48,7 @@ import numpy as np
 # CONFIGURE: point to the checkpoint you want to deploy
 # ─────────────────────────────────────────────────────────────────────────────
 CHECKPOINT = (
-    "/home/sripu715/IsaacLab/scripts/reinforcement_learning/rsl_rl/logs/rsl_rl/go1_himloco/2026-04-17_12-19-24/model_24600.pt"
+    "/home/sripu715/IsaacLab/scripts/reinforcement_learning/rsl_rl/logs/rsl_rl/go1_himloco/2026-05-07_20-35-31/model_15000.pt"
 )
 OUTPUT_DIR = os.path.join(os.path.dirname(CHECKPOINT), "go1_deploy")
 
@@ -73,17 +73,28 @@ HIDDEN_DIMS = [512, 256, 128]   # actor_hidden_dims
 # Isaac order: [FL_hip, FR_hip, RL_hip, RR_hip, FL_th, FR_th, RL_th, RR_th,
 #               FL_kn,  FR_kn,  RL_kn,  RR_kn]
 # ─────────────────────────────────────────────────────────────────────────────
-DELTA_LO = np.array([
-    -0.20, -0.20, -0.25, -0.20,   # FL FR RL RR hip  (RL wider for fault compensation)
-    -0.35, -0.35, -0.35, -0.35,   # thighs
-    -0.35, -0.35, -0.35, -0.35,   # calves
-], dtype=np.float32)
+# DELTA_LO = np.array([
+#     -0.20, -0.20, -0.25, -0.20,   # FL FR RL RR hip  (RL wider for fault compensation)
+#     -0.35, -0.35, -0.35, -0.35,   # thighs
+#     -0.35, -0.35, -0.35, -0.35,   # calves
+# ], dtype=np.float32)
+#
+# DELTA_HI = np.array([
+#      0.20,  0.20,  0.25,  0.20,   # FL FR RL RR hip
+#      0.35,  0.35,  0.35,  0.35,   # thighs
+#      0.35,  0.35,  0.35,  0.35,   # calves
+# ], dtype=np.float32)
+DELTA_LO = np.array(
+            [-0.08, -0.08, -0.08, -0.08,   # hips: ±0.20 → ±0.08
+             -0.35, -0.35, -0.35, -0.35,   # thighs unchanged
+             -0.35, -0.35, -0.35, -0.35,   # calves unchanged
+            ], dtype=np.float32)
 
-DELTA_HI = np.array([
-     0.20,  0.20,  0.25,  0.20,   # FL FR RL RR hip
-     0.35,  0.35,  0.35,  0.35,   # thighs
-     0.35,  0.35,  0.35,  0.35,   # calves
-], dtype=np.float32)
+DELTA_HI = np.array(
+            [ 0.08,  0.08,  0.08,  0.08,   # hips: ±0.20 → ±0.08
+              0.35,  0.35,  0.35,  0.35,   # thighs unchanged
+              0.35,  0.35,  0.35,  0.35,   # calves unchanged
+            ], dtype=np.float32)
 
 _MID  = torch.tensor((DELTA_HI + DELTA_LO) / 2.0)   # all zeros — symmetric
 _HALF = torch.tensor((DELTA_HI - DELTA_LO) / 2.0)   # [0.20,0.20,0.25,0.20, 0.35×8]
