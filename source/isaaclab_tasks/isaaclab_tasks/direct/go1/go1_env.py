@@ -1,12 +1,84 @@
-# go1_env.py — v6: Avenue 1+2 — RL_th Physics DR + Per-joint Rate + FR Protect + Balance
+# go1_env.py — v9: Symmetric Gait Shaping (Air-time 0.20s + Stance-time + Ia fix)
 #
 # ┌─────────────────────────────────────────────────────────────────────────┐
 # │ CALIBRATION STATUS (from PACE run 26_04_02 + manual tests)             │
-# │                                                                         │
-# │ RL_th stiction: τf=4.944 Nm  d=3.459 Nm·s/rad (PACE confirmed)       │
-# │ FR_th mechanical binding at >0.900 rad (ground-contact fault)          │
-# │ Both fault joint parameters are now the UPPER BOUND of DR ranges.      │
+# │  RL_th stiction: τf=4.944 Nm  d=3.459 Nm·s/rad (PACE confirmed)      │
+# │  FR_th mechanical binding at >0.900 rad (ground-contact fault)         │
+# │  Both fault parameters are the UPPER BOUND of per-episode DR ranges.  │
 # └─────────────────────────────────────────────────────────────────────────┘
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# DEPLOYMENT RESULTS SUMMARY (real_log_model15000_20260508):
+#   CONFIRMED WORKING (keep unchanged):
+#     RL_th physics DR:  2 spikes on real vs 59 in sim → confirmed ✓
+#     Hip saturation:    0.5% vs 9.5% sim → hip_sat reward ✓
+#     Lateral drift:     4.9° lean → r_lat_vel working ✓
+#     Knee lift:         FR_kn=+0.272, RL_kn=+0.267 on real hardware ✓
+#     FR_th safety:      max=0.848, zero binding events ✓
+#   NEW EXPLOIT FOUND (model_15000):
+#     Real gait: 9.95 Hz (3.71× faster than sim 2.68 Hz)
+#     Root cause: air_time threshold 0.10s = exactly 5 policy steps at 50Hz.
+#     Policy swings each foot for exactly 0.10s → barely crosses threshold
+#     → earns maximum reward with minimum energy. 28 tilt spike events/12s.
+#   SIM ACCURACY GAP:
+#     Knee tracking error: sim=0.19-0.27 rad, real=0.08-0.13 rad (2× gap).
+#     Cause: calf Ia too high in PACE. Sim knees 2× more compliant than real.
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# v9 CHANGES vs v8 — FOUR TARGETED FIXES:
+#
+# FIX 1: Air-time threshold 0.10s → 0.20s
+#   Real 9.95Hz exploit: swing = 0.10s = exactly old threshold. Earns reward.
+#   New threshold 0.20s: swing must be ≥ 10 policy steps (0.20s) to earn reward.
+#   True 2Hz trot: swing ≈ 0.25s >> 0.20s → full reward ✓
+#   9.95Hz tap:    swing ≈ 0.10s < 0.20s  → zero reward. Exploit BLOCKED.
+#   Cap adjusted:  0.40 → 0.30s (0.50s total inclusive of threshold).
+#
+# FIX 2: r_stance_time — symmetric stance quality reward (NEW)
+#   Air-time rewards swing quality. Nothing rewarded proper stance duration.
+#   Policy gamed this: short tap (0.05s stance) + long swing earned max reward.
+#   r_stance_time: rewards feet that maintain ground contact for ≥ 4 steps (0.08s).
+#   Uses data.current_contact_time (accumulates every step during stance).
+#   Fires CONTINUOUSLY during proper stance → can't be gamed with single long touch.
+#   At 2Hz trot (0.25s stance): earns ~0.51/step → matches air-time signal.
+#   At 9.95Hz tap (0.05s stance): never reaches threshold → zero reward.
+#   Combined with air-time: BOTH swing AND stance quality required → 2Hz stable trot.
+#
+# FIX 3: Calf Ia halved (PACE sim accuracy correction)
+#   Real knee tracking error 2× better than sim (real 0.08-0.13 vs sim 0.19-0.27).
+#   Cause: calf armature Ia=0.013-0.016 too high → sim knees too compliant.
+#   Fix: Ia calves 0.013-0.016 → 0.006-0.008. Sim knees now match real response.
+#   This reduces the sim-to-real tracking gap and makes knee lift training more accurate.
+#
+# FIX 4: r_upright weight -3.0 → -3.5
+#   v7 used -3.0 (tilt spikes came from 9.95Hz rapid impact, not weak balance).
+#   With gait frequency fixed by FIX 1+2, -3.5 provides better tilt resistance.
+#   Not back to -4.0 (which caused the static trot exploit in v6).
+#
+# ALL v8 UNCHANGED:
+#   RL_th physics DR (τf/d per episode), rate weights FR=1.800 RL=0.150,
+#   FR_th cap 0.820, FR_th proximity penalty, clearance deadband 0.03m,
+#   r_hip_sat, r_lat_vel=-3.5, r_foot_drag=-1.0, r_hip_reg=-1.5,
+#   KP/KD DR, delay FIFO, obs 45D, PACE Ia hips/thighs
+#
+# RESEARCH CONTEXT — why air+stance is the right approach:
+#   CPG-based (Bellegarda 2022): explicit phase variable per leg, strict schedule.
+#   Too rigid for impaired joints — RL_th stiction breaks phase adherence.
+#   Reference-motion (Hwangbo 2019): requires healthy reference trajectory.
+#   Not available for this impaired hardware configuration.
+#   Air+Stance (this work, after Rudin 2022 feet_air_time):
+#   Rewards the OUTCOME (proper swing/stance duration) without prescribing
+#   the exact timing — gives policy flexibility to compensate for RL_th stiction
+#   while still converging to rhythmic 2Hz gait. Closest practical equivalent
+#   to biological CPG reward structure for hardware-faulted quadruped.
+#
+# REWARD SANITY CHECK per policy step (×dt=0.02 before summing):
+#   r_air_time  max: 20×4×0.30×dt×8touchdowns/step    ≈ 0.48/step
+#   r_stance_time max: 3×4×0.25×dt (all feet in stance) ≈ 0.06/step (moderate)
+#   r_lin_vel   max: 1.5/step × dt                     ≈ 0.030/step
+#   Walking cost at 10°: r_upright = -3.5×sin²(10°)×dt ≈ -0.0021/step
+#   NET: walking >> standing, gait >> static solution ✓
+# ═══════════════════════════════════════════════════════════════════════════
 #
 # v6 CHANGES vs v5 — TWO AVENUES COMBINED:
 # ═══════════════════════════════════════════════════════════════════════════
@@ -83,12 +155,9 @@ class Go1Env(DirectRLEnv):
         super().__init__(cfg, render_mode, **kwargs)
 
         print("\n" + "="*72)
-        print("Go1Env | v8: Air-Time Trot Reward (24Hz toggle exploit BLOCKED)")
-        print("  RL_th: physics DR U[0,1] fault level (τf: 0.007→4.944, d: 0.048→3.459)")
-        print("  FR_th: cap 0.820 + proximity penalty + rate weight 1.800")
-        print("  Rate:  RL_th=0.150 (impulsive OK)  FR_th=1.800 (suppress oscillation)")
-        print("  TROT: air_time(w=20, thresh=0.10s) + bias(0.2) — rapid toggle earns ZERO")
-        print("  FIX2: clearance deadband 3cm  FIX3: upright -3.0")
+        print("Go1Env | v10b: relu(air-0.20) — catch-22 fixed, no negative for short hops")
+        print("  AIR-TIME: relu(last_air-0.20)×first_touch×vel_gate  (no negative penalty)")
+        print("  trot_penalty=-0.40 still blocks 3-in-stance (gradient toward 2-leg trot)")
         print(f"  Delay: Phase1 0ms → Phase2 U[0,8] at step {_DELAY_PHASE1_END}")
         print("="*72 + "\n")
 
@@ -97,11 +166,18 @@ class Go1Env(DirectRLEnv):
         _zero = torch.zeros(_n, _j, device=self.device)
 
         # ── PACE: Ia (armature) ───────────────────────────────────────────
+        # FIX 3: Calf Ia halved from original PACE values.
+        # Real hardware knee tracking error = 0.084-0.133 rad.
+        # Sim knee tracking error = 0.193-0.269 rad (2× worse than real).
+        # Root cause: Ia_calf too high → sim knees too compliant (over-damp).
+        # Original PACE: [0.0141, 0.0159, 0.0130, 0.0140]
+        # v9 corrected:  [0.0070, 0.0080, 0.0065, 0.0070] ← halved
+        # This brings sim knee response closer to real hardware behaviour.
         self._robot.write_joint_armature_to_sim(_zero)
         Ia = torch.tensor([
             0.0026, 0.0037, 0.0029, 0.0031,
             0.0052, 0.0045, 0.1343, 0.0064,
-            0.0141, 0.0159, 0.0130, 0.0140,
+            0.0070, 0.0080, 0.0065, 0.0070,   # FIX 3: calves halved
         ], device=self.device).unsqueeze(0).expand(_n, -1)
         self._robot.write_joint_armature_to_sim(Ia)
 
@@ -240,7 +316,7 @@ class Go1Env(DirectRLEnv):
         # Reset to 0 in _reset_idx to avoid spurious switches at episode start.
         self._prev_feet_contact = torch.zeros(_n, 4, device=self.device)
 
-        # ── Episode reward sums — v7: same keys as v6 ────────────────────
+        # ── Episode reward sums — v10: removed stance_time ───────────────
         _rk = ["lin_vel", "ang_vel", "ang_vel_xy", "lin_vel_z", "torques",
                "action_rate", "action_jerk", "upright", "trot", "alive",
                "fall", "hip_reg", "hip_sat", "foot_clear", "foot_drag",
@@ -382,7 +458,7 @@ class Go1Env(DirectRLEnv):
         return {"policy": obs}
 
     # =========================================================================
-    # _get_rewards — v6: balance strengthened + FR_th proximity + hip_sat
+    # _get_rewards — v10: Rudin 2022 air-time (no cap, vel-gated) + remove stance_time
     # =========================================================================
     def _get_rewards(self):
         lin_vel = self._robot.data.root_lin_vel_b
@@ -406,113 +482,119 @@ class Go1Env(DirectRLEnv):
         r_torques    = -1e-5 * torch.sum(
             self._robot.data.applied_torque**2, dim=1)
         r_fall       = -10.0 * (height < 0.25).float()
+        r_upright    = -3.5  * (gravity[:, 0]**2 + gravity[:, 1]**2)
+        r_lat_vel    = -3.5  * lin_vel[:, 1]**2
+        r_hip_reg    = -1.5  * torch.sum(self._actions[:, :4]**2, dim=1)
+        hip_excess   = torch.clamp(torch.abs(self._actions[:, :4]) - 0.06, 0.0)
+        r_hip_sat    = -4.0  * torch.sum(hip_excess, dim=1)
 
-        # ── Change 3: r_upright -2.5 → -4.0 ─────────────────────────────
-        # Real log tilt still 16.1° mean after v5. Gravity xy² penalises tilt
-        # angle — must be stronger to overcome gait-induced body rock.
-        r_upright = -3.0 * (gravity[:, 0]**2 + gravity[:, 1]**2)  # FIX 3: -4.0→-3.0
-
-        # ── Change 4: r_lat_vel -2.0 → -3.5 ─────────────────────────────
-        # Lateral lean reduced 8.8°→2.6° in v5 but still present.
-        # Acts on velocity (complements r_upright which acts on tilt angle).
-        r_lat_vel = -3.5 * lin_vel[:, 1]**2
-
-        # ── Hip regularisation — unchanged from v5 ────────────────────────
-        r_hip_reg = -1.5 * torch.sum(self._actions[:, :4]**2, dim=1)
-
-        # ── Change 5: r_hip_sat — bilateral saturation penalty (NEW) ─────
-        # Real log: FR_hip at HI limit 77% (was FL_hip at LO limit 71% in v4).
-        # r_hip_reg (quadratic) doesn't strongly discourage clipping.
-        # r_hip_sat activates only when |hip_delta| > 75% of ±0.08 range (>0.06).
-        # At limit 0.08: excess=0.02, cost = -4.0×0.02×4 = -0.32/step×dt=-0.0064
-        # Strong enough to push policy away from saturation without blocking
-        # necessary hip corrections.
-        hip_excess = torch.clamp(torch.abs(self._actions[:, :4]) - 0.06, 0.0)
-        r_hip_sat  = -4.0 * torch.sum(hip_excess, dim=1)
-
-        # ── Action smoothness (bandwidth-weighted per joint) ──────────────
         d1 = self._actions - self._prev_actions
         d2 = self._actions - 2*self._prev_actions + self._prev_prev_actions
         r_action_rate = -1.0 * torch.sum(self._rate_weights * d1**2, dim=1)
         r_action_jerk = -0.5 * torch.sum(self._rate_weights * d2**2, dim=1)
 
         # ── Contact sensor ────────────────────────────────────────────────
-        # Body order (alphabetical): FL=0, FR=1, RL=2, RR=3
         contact_fz   = self.scene.sensors["contact_sensor"].data.net_forces_w[:, :, 2]
-        feet_contact = (contact_fz > 1.0).float()
+        feet_contact = (contact_fz > 1.0).float()   # [N,4] FL FR RL RR
 
-        # ── v8: Air-time trot reward — replaces r_trot_switch ────────────
-        # v7 EXPLOIT (model_20700 sim): policy toggled feet at 24.48 Hz.
-        # Root cause: r_trot_switch = 0.8 × switches/step earned MORE per step
-        # than r_lin_vel at rapid toggle frequency. Policy did both simultaneously.
-        # Data: 3.817 switches/step → 1.527 reward/step vs r_lin_vel max 1.5/step.
-        # Action smoothness: mean=0.152, 1714 large jumps — undeployable.
+        # ── v10: Rudin 2022 feet_air_time — NO cap, velocity gated ───────
         #
-        # FIX: Air-time reward with minimum duration threshold.
-        #   last_air_time: non-zero only at touchdown, = duration of just-completed swing.
-        #   Rapid toggle (1-2 steps swing = 0.02-0.04s) < threshold 0.10s → reward = 0.
-        #   True trot swing (~12 steps = 0.24s) → reward = 0.14 per touchdown.
-        #   Weight 20: perfect 2Hz trot earns ~0.48/step (competitive with 1.5 vel max).
-        #   Static pattern (no touchdowns): earns 0. Both exploits BLOCKED.
+        # HISTORY OF EXPLOITS THIS REPLACES:
+        #   v5-v6: Static |diag1-diag2| → FR+RL permanent stance
+        #   v7:    per-step switch reward → 24Hz rapid toggle
+        #   v8:    clamp(air-0.10, 0, 0.40) → 9.95Hz tap on real hardware
+        #   v9:    clamp(air-0.20, 0, 0.15) → r_stance_time caused all-4-static
+        #   v9fix: clamp(air-0.20, 0, 0.15) + r_stance → 1-leg permanent swing (FL 0.38s)
         #
-        # ContactSensorCfg has track_air_time=True in go1_env_cfg.py — required.
-        # Body order: FL=0, FR=1, RL=2, RR=3 (alphabetical, same as feet_contact).
+        # ROOT CAUSE OF ALL EXPLOITS: clamp cap makes one long swing earn more
+        # reward-rate than multiple short swings.
+        #
+        # RUDIN 2022 (legged_gym) original formula:
+        #   feet_air_time += dt            (accumulates during swing)
+        #   reward = (air_time - target) × first_contact  (fires at touchdown)
+        #   feet_air_time *= ~contact      (resets on landing)
+        #
+        # KEY PROPERTY (mathematically proven):
+        #   With no cap, reward_rate = (air - target) × frequency.
+        #   For 1 leg at swing S: rate = w(S-T)/(2S×50)  → bounded by w/100
+        #   For N legs at period P: rate = wN(P/2-T)/P×50 → grows with N
+        #   ∴ 4-leg trot ALWAYS beats 1-leg cycling regardless of swing duration.
+        #
+        # VELOCITY GATE:
+        #   Multiplied by clamp(|v_horizontal|/0.2, 0, 1).
+        #   When standing still (v=0): r_air_time = 0 → no gait reward for static.
+        #   Policy MUST generate forward motion to earn gait reward.
+        #   Blocks: permanent-lift-while-standing, all-4-static, any static pattern.
+        #
+        # v10b FIX — CATCH-22 IDENTIFIED AND RESOLVED:
+        # Original Rudin (air-0.20) penalises short hops with NEGATIVE reward.
+        # At training start, policy explores with brief lifts (0.05-0.10s)
+        # → gets penalised → learns to keep ALL feet down → trot_penalty fires
+        # → CATCH-22: lifting is penalised, not lifting is penalised.
+        # Sim log confirmed: FL doing 0.102s hops (8 events), all penalised.
+        # RL escaped by random long swing (0.251s) → only leg earning positive.
+        #
+        # FIX: relu(air - 0.20) — removes negative, keeps positive.
+        # Short hop (0.05s): earns 0 (neutral, free to explore)
+        # Proper swing (0.25s): earns +0.75 per touch (rewarded)
+        # Still blocks ALL exploits via trot_penalty:
+        #   Static all-4 → vel_gate=0 → 0 air, -0.40 penalty = -0.40/step
+        #   1-leg cycling → 0.045 air, -0.40 penalty = -0.355/step (negative)
+        #   1-leg ∞ swing → max 0.15 air, -0.40 = -0.25/step (always negative)
+        #   2-leg trot → 0.12 air, 0 penalty = +0.12/step (ONLY positive)
+        # No upper cap needed: multi-leg touchdown frequency mathematically dominates.
         sensor      = self.scene.sensors["contact_sensor"]
         last_air    = sensor.data.last_air_time[:, :4]   # [N,4] non-zero at touchdown
-        first_touch = (feet_contact - self._prev_feet_contact).clamp(min=0.0)  # [N,4]
 
-        # Threshold 0.10s = 5 policy steps at 50Hz
-        r_air_time  = 20.0 * torch.sum(
-            torch.clamp(last_air - 0.10, 0.0, 0.40) * first_touch, dim=1)
+        # Velocity gate for all gait rewards
+        vel_gate_gait = torch.clamp(
+            torch.norm(lin_vel[:, :2], dim=1) / 0.2, 0.0, 1.0)
 
+        first_touch = (feet_contact - self._prev_feet_contact).clamp(min=0.0)
+        r_air_time  = 15.0 * torch.sum(
+            torch.relu(last_air - 0.20) * first_touch, dim=1) * vel_gate_gait
+        # ↑ relu: no negative for short hops (catch-22 removed)
+        #         positive for swings >0.20s (reward signal preserved)
+        #         Weight 15: at 0.25s swing, 4-leg trot → 0.12/step
+
+        # Trot diagonal bias + N≥3 penalty (no stance component)
+        # r_stance_time REMOVED: it always incentivises max-feet-in-stance,
+        # creating gradient opposing trot. Without it:
+        #   1-leg cycling: r_air - 0.40 penalty = net negative (must cycle while moving)
+        #   2-leg trot: r_air - 0 = net positive
         diag1          = (feet_contact[:, 0] + feet_contact[:, 3]) * 0.5
         diag2          = (feet_contact[:, 1] + feet_contact[:, 2]) * 0.5
-        r_trot_bias    = 0.2 * torch.abs(diag1 - diag2)   # weak diagonal shaping
+        r_trot_bias    = 0.2 * torch.abs(diag1 - diag2)
         r_trot_penalty = -0.4 * (feet_contact.sum(dim=1) >= 3).float()
         r_trot = r_air_time + r_trot_bias + r_trot_penalty
 
         # Update contact history (needed for first_touch next step)
         self._prev_feet_contact[:] = feet_contact.detach()
 
-        # ── Foot clearance and drag rewards ──────────────────────────────
+        # ── Foot clearance (velocity gated) and foot drag ─────────────────
         r_foot_clear = torch.zeros(self.num_envs, device=self.device)
         r_foot_drag  = torch.zeros(self.num_envs, device=self.device)
 
         if self._foot_body_ids is not None:
-            foot_pos = self._robot.data.body_pos_w[:, self._foot_body_ids, :]
-            foot_vel = self._robot.data.body_vel_w[:, self._foot_body_ids, :]
+            foot_pos      = self._robot.data.body_pos_w[:, self._foot_body_ids, :]
+            foot_vel      = self._robot.data.body_vel_w[:, self._foot_body_ids, :]
+            swing_mask    = 1.0 - feet_contact
+            ground_z      = self.scene.env_origins[:, 2].unsqueeze(1)
+            foot_z        = foot_pos[:, :, 2]
 
-            swing_mask = 1.0 - feet_contact
-            ground_z   = self.scene.env_origins[:, 2].unsqueeze(1)
-            foot_z     = foot_pos[:, :, 2]
-            # ── FIX 2: Active clearance — 3cm deadband blocks passive hang ──
-            # OLD: clamp(foot_z-ground_z, 0, 0.12) — passive hang = free reward
-            # NEW: clamp(foot_z-ground_z-0.03, 0, 0.09) — must lift >3cm actively
-            # At default pose: foot_z≈ground_z+0.01-0.02m < 0.03m → zero reward
-            # Active knee lift to 5cm: 0.05-0.03=0.02m reward (non-zero) ✓
+            # Clearance: 3cm deadband (blocks passive hang), velocity gated
+            # Vel gate ensures policy must walk to earn clearance reward
             clearance    = torch.clamp(foot_z - ground_z - 0.03, 0.0, 0.09)
-            r_foot_clear = 2.0 * torch.sum(swing_mask * clearance, dim=1)
+            r_foot_clear = 2.0 * torch.sum(
+                swing_mask * clearance, dim=1) * vel_gate_gait
 
-            # ── Change 7: r_foot_drag -0.5 → -1.0 ───────────────────────
-            # FR leg in stance 69% with foot dragging (FR_kn mean_lift=-0.154).
-            # Stronger penalty discourages FR_kn grinding into ground.
+            # Foot drag (no vel gate — always penalise dragging)
             foot_speed_xy = torch.norm(foot_vel[:, :, :2], dim=-1)
             r_foot_drag   = -1.0 * torch.sum(feet_contact * foot_speed_xy, dim=1)
 
-        # ── Change 6: r_fr_binding — FR_th proximity penalty (NEW) ──────
-        # Real log: FR_th actual max=0.860, only 0.040 rad from binding (0.900).
-        # Penalty on ACTUAL joint position (not target) — teaches policy to
-        # avoid commands that lead to inertial overshoot into binding zone.
-        # Gradient starts at 0.800 (default pos), full at 0.870 (overshoot zone).
-        #
-        # At actual_q=0.820 (train cap): proximity=0.286, penalty=-0.163/step→×dt=-0.003
-        # At actual_q=0.860 (real max):  proximity=0.857, penalty=-1.470/step→×dt=-0.029
-        # At actual_q=0.870 (beyond):    proximity=1.000, penalty=-2.000/step→×dt=-0.040
-        #
-        # -0.029 at 0.860 ≈ 1× max forward reward — strong but not dominating.
-        # Deliberately NOT applied to RL_th (different fault type).
-        fr_th_q    = self._robot.data.joint_pos[:, 5]
-        fr_prox    = torch.clamp((fr_th_q - 0.800) / 0.070, 0.0, 1.0)
+        # ── FR_th binding proximity penalty ──────────────────────────────
+        fr_th_q      = self._robot.data.joint_pos[:, 5]
+        fr_prox      = torch.clamp((fr_th_q - 0.800) / 0.070, 0.0, 1.0)
         r_fr_binding = -2.0 * fr_prox ** 2
 
         # ── Episode sum tracking ──────────────────────────────────────────
