@@ -48,14 +48,14 @@ import numpy as np
 # CONFIGURE: point to the checkpoint you want to deploy
 # ─────────────────────────────────────────────────────────────────────────────
 CHECKPOINT = (
-    "/home/sripu715/IsaacLab/scripts/reinforcement_learning/rsl_rl/logs/rsl_rl/go1_himloco/2026-05-08_22-28-12/model_24000.pt"
+    "/home/sripu715/IsaacLab/scripts/reinforcement_learning/rsl_rl/logs/rsl_rl/go1_himloco/2026-05-12_20-30-45/model_20000.pt"
 )
 OUTPUT_DIR = os.path.join(os.path.dirname(CHECKPOINT), "go1_deploy")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Architecture — must match rsl_rl_ppo_cfg.py exactly
 # ─────────────────────────────────────────────────────────────────────────────
-OBS_DIM     = 45
+OBS_DIM     = 46
 ACTION_DIM  = 12
 HIDDEN_DIMS = [512, 256, 128]   # actor_hidden_dims
 

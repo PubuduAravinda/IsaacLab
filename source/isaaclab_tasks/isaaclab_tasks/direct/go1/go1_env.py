@@ -155,9 +155,11 @@ class Go1Env(DirectRLEnv):
         super().__init__(cfg, render_mode, **kwargs)
 
         print("\n" + "="*72)
-        print("Go1Env | v10b: relu(air-0.20) — catch-22 fixed, no negative for short hops")
-        print("  AIR-TIME: relu(last_air-0.20)×first_touch×vel_gate  (no negative penalty)")
-        print("  trot_penalty=-0.40 still blocks 3-in-stance (gradient toward 2-leg trot)")
+        print("Go1Env | v13: Gait Quality Gate on Velocity Reward + ang_vel_xy fix")
+        print("  GATE: r_lin_vel × (0.30 + 0.70×gait_quality)  gait_quality∈[0,1]")
+        print("  n_contact=2(trot)→gate=1.0  n=3or1→gate=0.65  n=4or0→gate=0.30")
+        print("  ang_vel_xy: -0.15→-0.08  (was causing oscillation loop)")
+        print("  46D obs: f_cmd~U[1.5,3.0]Hz  air target=1/(2×f_cmd)  relu")
         print(f"  Delay: Phase1 0ms → Phase2 U[0,8] at step {_DELAY_PHASE1_END}")
         print("="*72 + "\n")
 
@@ -316,6 +318,16 @@ class Go1Env(DirectRLEnv):
         # Reset to 0 in _reset_idx to avoid spurious switches at episode start.
         self._prev_feet_contact = torch.zeros(_n, 4, device=self.device)
 
+        # ── v12: Gait frequency command — narrower range for stable learning ─
+        # v11 used U[1.0, 4.0] Hz → 4× range → policy struggled to condition.
+        # v12 uses U[1.5, 3.0] Hz → 2× range → achievable for the policy.
+        # At deploy: set f_cmd=2.0 → obs[45]=0.333 → target_swing=0.250s → 2Hz.
+        # Normalisation: obs[45]=(f_cmd-1.0)/3.0 uses full [0,1] range for
+        # future extension to U[1,4], so obs scale stays consistent.
+        self._episode_f_cmd = torch.full((_n,), 2.0, device=self.device)
+        self._f_cmd_lo = 1.5   # Hz — lower bound of training range
+        self._f_cmd_hi = 3.0   # Hz — upper bound (2× ratio, manageable variance)
+
         # ── Episode reward sums — v10: removed stance_time ───────────────
         _rk = ["lin_vel", "ang_vel", "ang_vel_xy", "lin_vel_z", "torques",
                "action_rate", "action_jerk", "upright", "trot", "alive",
@@ -327,6 +339,7 @@ class Go1Env(DirectRLEnv):
                              if os.environ.get("GO1_EVAL_PHASE2") == "1" else 0)
 
         # ── Observation noise — hardware Phase 1 (Table 6+7 PDF) ─────────
+        # v11: 46 elements (added 0.0 for obs[45] = f_cmd command, no noise)
         self._obs_noise_std = torch.tensor([
             0.0, 0.0, 0.0,
             0.000132, 0.001016, 0.000132, 0.000132,
@@ -337,7 +350,8 @@ class Go1Env(DirectRLEnv):
             0.005621, 0.005621, 0.005621, 0.005621,
             0.01689,  0.00606,  0.01315,
             0.03086,  0.06381,  0.04405,
-            *([0.0] * 12),
+            *([0.0] * 12),   # prev_actions: no noise
+            0.0,             # obs[45]: f_cmd command: no noise
         ], device=self.device)
 
         self._obs_noise_enabled   = True
@@ -362,7 +376,7 @@ class Go1Env(DirectRLEnv):
         self._sim_log_maxsteps = N
         self._slog = {
             k: np.zeros((N, s) if s > 1 else N, np.float32)
-            for k, s in [("obs_raw",45),("tanh_delta",12),("raw_net",12),
+            for k, s in [("obs_raw",46),("tanh_delta",12),("raw_net",12),  # obs_raw now 46D
                          ("target_q",12),("actual_q",12),("actual_qd",12),
                          ("proj_grav",3),("ang_vel",3),("lin_vel",3),
                          ("cmd",3),("contact",4),("tilt_deg",1),("reward",1)]
@@ -442,23 +456,28 @@ class Go1Env(DirectRLEnv):
         pass
 
     # =========================================================================
-    # _get_observations — UNCHANGED (45D, no foot signals)
+    # _get_observations — v11: 46D (obs[45] = gait freq cmd normalised)
     # =========================================================================
     def _get_observations(self) -> dict:
+        # obs[45] = (f_cmd - 1.0) / 3.0 → [0.0, 1.0]
+        # 0.0 = 1Hz (slow),  0.333 = 2Hz (trot),  1.0 = 4Hz (fast)
+        f_cmd_norm = ((self._episode_f_cmd - self._f_cmd_lo)
+                      / (self._f_cmd_hi - self._f_cmd_lo)).unsqueeze(1)  # [N,1]
         obs = torch.cat([
-            self.command_manager.command[:, :3],
-            self._robot.data.joint_pos - self._robot.data.default_joint_pos,
-            torch.clamp(self._robot.data.joint_vel,      -5.0, 5.0),
-            torch.clamp(self._robot.data.root_ang_vel_b, -5.0, 5.0),
-            self._robot.data.projected_gravity_b,
-            self._prev_actions,
+            self.command_manager.command[:, :3],                           # [0:3]
+            self._robot.data.joint_pos - self._robot.data.default_joint_pos,  # [3:15]
+            torch.clamp(self._robot.data.joint_vel,      -5.0, 5.0),      # [15:27]
+            torch.clamp(self._robot.data.root_ang_vel_b, -5.0, 5.0),      # [27:30]
+            self._robot.data.projected_gravity_b,                          # [30:33]
+            self._prev_actions,                                            # [33:45]
+            f_cmd_norm,                                                    # [45]
         ], dim=-1)
         if self._obs_noise_enabled:
             obs = obs + torch.randn_like(obs) * self._obs_noise_std
         return {"policy": obs}
 
     # =========================================================================
-    # _get_rewards — v10: Rudin 2022 air-time (no cap, vel-gated) + remove stance_time
+    # _get_rewards — v13: gait quality gate on velocity reward + ang_vel_xy fix
     # =========================================================================
     def _get_rewards(self):
         lin_vel = self._robot.data.root_lin_vel_b
@@ -468,16 +487,44 @@ class Go1Env(DirectRLEnv):
         cmd     = self.command_manager.command
         tilt    = torch.sqrt(gravity[:, 0]**2 + gravity[:, 1]**2)
 
-        # ── Velocity tracking ─────────────────────────────────────────────
-        r_lin_vel = 1.5 * torch.exp(-(lin_vel[:, 0] - cmd[:, 0])**2 / 0.25)
-        r_ang_vel = 0.5 * torch.exp(-(ang_vel[:, 2] - cmd[:, 2])**2 / 0.25)
+        # ── Contact — needed early for gait quality gate on velocity ─────
+        # Body order (alphabetical): FL=0, FR=1, RL=2, RR=3
+        contact_fz   = self.scene.sensors["contact_sensor"].data.net_forces_w[:, :, 2]
+        feet_contact = (contact_fz > 1.0).float()   # [N,4]
+        n_contact    = feet_contact.sum(dim=1)        # [N]
 
-        # ── Velocity-gated alive ──────────────────────────────────────────
+        # ── Gait quality gate — triangular peaked at 2-foot (trot) contact ─
+        # n=0: 0.0  n=1: 0.5  n=2: 1.0  n=3: 0.5  n=4: 0.0
+        # Multiplies velocity reward → proper trot earns FULL velocity reward.
+        # Shuffling (4-foot) or hopping (0,1-foot) earns only 30%.
+        #
+        # WHY this is the correct fix (from data at iter 1707):
+        #   Air-time w=15 gain from trot: ~120 per episode
+        #   Velocity cost of slowing for trot: ~776 per episode
+        #   Air-time is only 15% of velocity loss → policy correctly ignores gait.
+        #   With gate: 4-foot earns 30% of velocity, 2-foot earns 100%.
+        #   Velocity gain from proper gait: 0.70 × 1140 = 798 per episode.
+        #   Now trot earns MORE than shuffling through velocity alone.
+        #   This mirrors biology: animals trot because it's energy-efficient
+        #   for covering ground, not because trot is directly rewarded.
+        gait_quality  = torch.clamp(1.0 - torch.abs(n_contact - 2.0) / 2.0, 0.0, 1.0)
+        gait_gate     = 0.30 + 0.70 * gait_quality   # [0.30, 1.00]
+
+        # ── Velocity tracking — gated by gait quality ─────────────────────
+        r_lin_vel_raw = 1.5 * torch.exp(-(lin_vel[:, 0] - cmd[:, 0])**2 / 0.25)
+        r_lin_vel     = r_lin_vel_raw * gait_gate   # ← gate applied here
+        r_ang_vel     = 0.5 * torch.exp(-(ang_vel[:, 2] - cmd[:, 2])**2 / 0.25)
+
+        # ── Velocity-gated alive — forward-only (vx ≥ 0 always in v12+) ──
         vel_gate = torch.clamp(lin_vel[:, 0] / 0.2, 0.0, 1.0)
         r_alive  = 0.3 * vel_gate * ((height > 0.28) & (tilt < 0.3)).float()
 
         # ── Standard penalties ────────────────────────────────────────────
-        r_ang_vel_xy = -0.05 * (ang_vel[:, 0]**2 + ang_vel[:, 1]**2)
+        # r_ang_vel_xy: reverted from -0.15 back to -0.08.
+        # -0.15 was too strong: created compensatory rapid angular corrections
+        # (RMS body angular velocity rose to 0.69 rad/s, causing oscillation loop).
+        # -0.08 gives meaningful trunk damping without driving reactive overshoots.
+        r_ang_vel_xy = -0.08 * (ang_vel[:, 0]**2 + ang_vel[:, 1]**2)
         r_lin_vel_z  = -4.0  * lin_vel[:, 2]**2
         r_torques    = -1e-5 * torch.sum(
             self._robot.data.applied_torque**2, dim=1)
@@ -493,13 +540,10 @@ class Go1Env(DirectRLEnv):
         r_action_rate = -1.0 * torch.sum(self._rate_weights * d1**2, dim=1)
         r_action_jerk = -0.5 * torch.sum(self._rate_weights * d2**2, dim=1)
 
-        # ── Contact sensor ────────────────────────────────────────────────
-        contact_fz   = self.scene.sensors["contact_sensor"].data.net_forces_w[:, :, 2]
-        feet_contact = (contact_fz > 1.0).float()   # [N,4] FL FR RL RR
+        # ── Contact sensor — already computed above (feet_contact, n_contact) ─
+        # feet_contact and n_contact from gait_gate section above — reuse here.
 
-        # ── v10: Rudin 2022 feet_air_time — NO cap, velocity gated ───────
-        #
-        # HISTORY OF EXPLOITS THIS REPLACES:
+        # ── v10b/v13: relu air-time with f_cmd target ─────────────────────
         #   v5-v6: Static |diag1-diag2| → FR+RL permanent stance
         #   v7:    per-step switch reward → 24Hz rapid toggle
         #   v8:    clamp(air-0.10, 0, 0.40) → 9.95Hz tap on real hardware
@@ -551,11 +595,19 @@ class Go1Env(DirectRLEnv):
             torch.norm(lin_vel[:, :2], dim=1) / 0.2, 0.0, 1.0)
 
         first_touch = (feet_contact - self._prev_feet_contact).clamp(min=0.0)
+
+        # v11: Air-time target from gait frequency command
+        # target_swing = 1 / (2 × f_cmd)
+        #   f_cmd=1Hz → 0.500s  f_cmd=2Hz → 0.250s  f_cmd=4Hz → 0.125s
+        # Policy learns to sustain swings that match the commanded frequency.
+        # At deploy: obs[45]=(2.0-1.0)/3.0=0.333 → f_cmd=2.0 → target=0.250s
+        # Hardware timing: policy explicitly targets 0.250s → gait ≈2Hz
+        target_swing = (1.0 / (2.0 * self._episode_f_cmd)).unsqueeze(1)  # [N,1]
+
         r_air_time  = 15.0 * torch.sum(
-            torch.relu(last_air - 0.20) * first_touch, dim=1) * vel_gate_gait
-        # ↑ relu: no negative for short hops (catch-22 removed)
-        #         positive for swings >0.20s (reward signal preserved)
-        #         Weight 15: at 0.25s swing, 4-leg trot → 0.12/step
+            torch.relu(last_air - target_swing) * first_touch, dim=1) * vel_gate_gait
+        # relu: no penalty for swings shorter than target (catch-22 removed v10b)
+        # target is now per-episode per-env (not fixed 0.20s)
 
         # Trot diagonal bias + N≥3 penalty (no stance component)
         # r_stance_time REMOVED: it always incentivises max-feet-in-stance,
@@ -717,6 +769,15 @@ class Go1Env(DirectRLEnv):
             getattr(actuator, self._bias_attr)[env_ids] = (
                 self._bias_values.unsqueeze(0).expand(n, -1))
 
+        # ── v12: Gait frequency command — U[1.5, 3.0] Hz per episode ────
+        # Narrower range than v11 (was U[1,4]) → 2× ratio vs 4×.
+        # obs[45] = (f_cmd-1.0)/3.0 → [0.167, 0.667] in this range.
+        # Policy learns: obs[45]=0.167→slow(1.5Hz), obs[45]=0.333→trot(2Hz).
+        self._episode_f_cmd[env_ids] = (
+            self._f_cmd_lo
+            + torch.rand(n, device=self.device) * (self._f_cmd_hi - self._f_cmd_lo)
+        )
+
         # ── Delay DR ──────────────────────────────────────────────────────
         if self._global_step < _DELAY_PHASE1_END:
             self._env_delays[env_ids] = 0
@@ -867,10 +928,13 @@ class Go1Env(DirectRLEnv):
                 cf  = sensor_dbg.data.net_forces_w[idx, :, 2]
                 fc  = (cf > 1.0).cpu().numpy()
                 lat = sensor_dbg.data.last_air_time[idx, :4].cpu().numpy()
+                f0  = self._episode_f_cmd[idx].item()
+                tgt = 1.0 / (2.0 * f0)
                 print(f"  contact:   FL={fc[0]} FR={fc[1]} RL={fc[2]} RR={fc[3]}")
                 print(f"  last_air:  FL={lat[0]:.3f} FR={lat[1]:.3f} "
-                      f"RL={lat[2]:.3f} RR={lat[3]:.3f} s  "
-                      f"(>0.10s earns reward  <0.10s=exploit)")
+                      f"RL={lat[2]:.3f} RR={lat[3]:.3f} s")
+                print(f"  f_cmd={f0:.2f}Hz  target_swing={tgt:.3f}s  "
+                      f"obs[45]={((f0-self._f_cmd_lo)/(self._f_cmd_hi-self._f_cmd_lo)):.3f}")
             except Exception:
                 pass
 

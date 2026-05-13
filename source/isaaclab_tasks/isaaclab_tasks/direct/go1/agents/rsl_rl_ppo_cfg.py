@@ -17,7 +17,7 @@ class Go1RslRlPpoCfg(RslRlOnPolicyRunnerCfg):
     device = "cuda:0"
 
     num_steps_per_env = 24                # Critical: ~2s rollout, matches paper
-    max_iterations = 25000                 # Long training (adjust as needed)
+    max_iterations = 35000                 # Long training (adjust as needed)
     save_interval = 100 #500                    # Save every 500 updates
     experiment_name = "go1_himloco"
     run_name = ""                          # Optional suffix
