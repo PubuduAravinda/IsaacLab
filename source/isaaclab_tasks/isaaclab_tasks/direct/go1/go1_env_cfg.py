@@ -231,10 +231,10 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
         ranges=mdp.commands.UniformVelocityCommandCfg.Ranges(
             lin_vel_x=(0.3, 0.9),
             lin_vel_y=(0.0, 0.0),
-            ang_vel_z=(0.0, 0.0),             # yaw=0 → prevents spinning exploit
+            ang_vel_z=(-0.0001, 0.0001),      # yaw=0 → prevents spinning exploit
             heading=(-np.pi / 8, np.pi / 8),
         ),
-        heading_command=True,
+        heading_command=False,
     )
 
     sim = SimulationCfg(

@@ -2,6 +2,18 @@
 import gymnasium as gym
 from . import agents  # Your agents folder (contains rsl_rl_ppo_cfg.py)
 
+from isaaclab_tasks.direct.go1.go1_nav_env_cfg import Go1NavEnvCfg
+
+gym.register(
+    id="Isaac-Go1-Nav-v0",
+    entry_point="isaaclab_tasks.direct.go1.go1_nav_env:Go1NavEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": "isaaclab_tasks.direct.go1.go1_nav_env_cfg:Go1NavEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Go1RslRlPpoCfg",
+    },
+)
+
 gym.register(
     id="Isaac-Velocity-Flat-Go1-Direct-v0",
     entry_point="isaaclab_tasks.direct.go1.go1_env:Go1Env",

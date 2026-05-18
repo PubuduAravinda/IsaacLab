@@ -155,12 +155,13 @@ class Go1Env(DirectRLEnv):
         super().__init__(cfg, render_mode, **kwargs)
 
         print("\n" + "="*72)
-        print("Go1Env | v13: Gait Quality Gate on Velocity Reward + ang_vel_xy fix")
+        print("Go1Env | v14: Mixed wz training (70% straight / 30% turning)")
         print("  GATE: r_lin_vel × (0.30 + 0.70×gait_quality)  gait_quality∈[0,1]")
         print("  n_contact=2(trot)→gate=1.0  n=3or1→gate=0.65  n=4or0→gate=0.30")
-        print("  ang_vel_xy: -0.15→-0.08  (was causing oscillation loop)")
-        print("  46D obs: f_cmd~U[1.5,3.0]Hz  air target=1/(2×f_cmd)  relu")
+        print("  ang_vel_xy: -0.08  |  46D obs: f_cmd~U[1.5,3.0]Hz")
         print(f"  Delay: Phase1 0ms → Phase2 U[0,8] at step {_DELAY_PHASE1_END}")
+        print("  WZ MIX: 70% envs wz=0 (straight), 30% envs wz~U[-0.20,+0.20]")
+        print("  → Normalizer will learn wz std≈0.063 → safe deploy range ±0.15")
         print("="*72 + "\n")
 
         _n    = self.num_envs
@@ -328,6 +329,28 @@ class Go1Env(DirectRLEnv):
         self._f_cmd_lo = 1.5   # Hz — lower bound of training range
         self._f_cmd_hi = 3.0   # Hz — upper bound (2× ratio, manageable variance)
 
+        # ── v14: Mixed wz command — per-episode bimodal distribution ─────────
+        # Problem: heading_command=True made wz converge to 0 immediately after
+        # heading alignment. Normalizer learned wz_std=0.0001 → any non-zero wz
+        # on real hardware is 1000× out of distribution → catastrophic falls.
+        #
+        # Fix: heading_command=False + direct wz sampling each episode reset.
+        #   70% of envs: wz = 0.0    (straight walking — preserves stability)
+        #   30% of envs: wz ~ U[-0.20, +0.20] rad/s  (teaches turning)
+        #
+        # Expected normalizer std ≈ 0.063 rad/s:
+        #   E[wz²] = 0.30 × (0.20²/3) = 0.004  →  std = √0.004 = 0.063
+        # On real hardware: wz=0.15 normalises to 0.15/0.063 = 2.4 → within range
+        # On real hardware: wz=0.20 normalises to 0.20/0.063 = 3.2 → near limit
+        # Recommended deploy range: ±0.15 rad/s  (safe with this training)
+        self._wz_cmd           = torch.zeros(_n, device=self.device)  # [N] per-env wz
+        self._WZ_STRAIGHT_PROB = 0.70    # fraction of envs with wz=0 each episode
+        self._WZ_MAX           = 0.20    # max turning rate [rad/s]
+        self._wz_reset_count   = 0       # for periodic debug prints
+        print(f"  [WZ MIX] STRAIGHT_PROB={self._WZ_STRAIGHT_PROB:.0%}  "
+              f"WZ_MAX=±{self._WZ_MAX:.2f} rad/s  "
+              f"expected_std≈{self._WZ_MAX*(self._WZ_STRAIGHT_PROB*0.013)**0.5:.3f}")
+
         # ── Episode reward sums — v10: removed stance_time ───────────────
         _rk = ["lin_vel", "ang_vel", "ang_vel_xy", "lin_vel_z", "torques",
                "action_rate", "action_jerk", "upright", "trot", "alive",
@@ -456,15 +479,25 @@ class Go1Env(DirectRLEnv):
         pass
 
     # =========================================================================
-    # _get_observations — v11: 46D (obs[45] = gait freq cmd normalised)
+    # _get_observations — v14: 46D with wz override from mixed distribution
+    # obs[0:3] = [vx_cmd, vy_cmd, wz_cmd]
+    #   vx, vy come from command_manager (unchanged)
+    #   wz comes from self._wz_cmd (bimodal: 70% zero, 30% ±0.20 rad/s)
+    # obs[45] = gait freq cmd normalised
     # =========================================================================
     def _get_observations(self) -> dict:
-        # obs[45] = (f_cmd - 1.0) / 3.0 → [0.0, 1.0]
-        # 0.0 = 1Hz (slow),  0.333 = 2Hz (trot),  1.0 = 4Hz (fast)
+        # obs[45] = (f_cmd - 1.5) / 1.5 → [0.0, 1.0] for range [1.5, 3.0]
         f_cmd_norm = ((self._episode_f_cmd - self._f_cmd_lo)
                       / (self._f_cmd_hi - self._f_cmd_lo)).unsqueeze(1)  # [N,1]
+
+        # Build cmd obs: vx/vy from command_manager, wz from mixed distribution
+        # heading_command=False → command_manager wz is ~0 (cfg: ±0.0001)
+        # We override obs[2] with our bimodal _wz_cmd
+        cmd_obs = self.command_manager.command[:, :3].clone()   # [N, 3]
+        cmd_obs[:, 2] = self._wz_cmd                            # override wz ← key change
+
         obs = torch.cat([
-            self.command_manager.command[:, :3],                           # [0:3]
+            cmd_obs,                                                       # [0:3] vx/vy/wz
             self._robot.data.joint_pos - self._robot.data.default_joint_pos,  # [3:15]
             torch.clamp(self._robot.data.joint_vel,      -5.0, 5.0),      # [15:27]
             torch.clamp(self._robot.data.root_ang_vel_b, -5.0, 5.0),      # [27:30]
@@ -477,7 +510,8 @@ class Go1Env(DirectRLEnv):
         return {"policy": obs}
 
     # =========================================================================
-    # _get_rewards — v13: gait quality gate on velocity reward + ang_vel_xy fix
+    # _get_rewards — v14: r_ang_vel uses self._wz_cmd (mixed distribution)
+    # All other rewards unchanged from v13
     # =========================================================================
     def _get_rewards(self):
         lin_vel = self._robot.data.root_lin_vel_b
@@ -513,7 +547,10 @@ class Go1Env(DirectRLEnv):
         # ── Velocity tracking — gated by gait quality ─────────────────────
         r_lin_vel_raw = 1.5 * torch.exp(-(lin_vel[:, 0] - cmd[:, 0])**2 / 0.25)
         r_lin_vel     = r_lin_vel_raw * gait_gate   # ← gate applied here
-        r_ang_vel     = 0.5 * torch.exp(-(ang_vel[:, 2] - cmd[:, 2])**2 / 0.25)
+        # v14: r_ang_vel uses self._wz_cmd (bimodal mixed distribution)
+        # NOT cmd[:, 2] — command_manager wz is ~0 (heading_command=False cfg)
+        # self._wz_cmd is the actual wz target set in _reset_idx per episode
+        r_ang_vel     = 0.5 * torch.exp(-(ang_vel[:, 2] - self._wz_cmd)**2 / 0.25)
 
         # ── Velocity-gated alive — forward-only (vx ≥ 0 always in v12+) ──
         vel_gate = torch.clamp(lin_vel[:, 0] / 0.2, 0.0, 1.0)
@@ -704,6 +741,29 @@ class Go1Env(DirectRLEnv):
         super()._reset_idx(env_ids)
         self.command_manager.reset(env_ids)
 
+        # ── v14: Mixed wz assignment — bimodal per episode ───────────────
+        # 70% of resetting envs: wz = 0.0 (straight walking)
+        # 30% of resetting envs: wz ~ U[-0.20, +0.20] rad/s (turning)
+        # This is assigned once per episode at reset and held constant.
+        # Consistent with heading_command=False in cfg (command_manager wz≈0).
+        # The reward r_ang_vel in _get_rewards tracks self._wz_cmd, not cmd[:,2].
+        _n_reset    = len(env_ids)
+        _is_turning = torch.rand(_n_reset, device=self.device) >= self._WZ_STRAIGHT_PROB
+        _wz_turn    = (torch.rand(_n_reset, device=self.device) * 2.0 - 1.0) * self._WZ_MAX
+        self._wz_cmd[env_ids] = torch.where(
+            _is_turning, _wz_turn, torch.zeros(_n_reset, device=self.device))
+
+        # Debug: print wz distribution every ~50k env-resets
+        self._wz_reset_count += _n_reset
+        if self._wz_reset_count % 50000 < _n_reset:
+            _n_turn  = _is_turning.sum().item()
+            _all_std = self._wz_cmd.std().item()
+            _all_mean= self._wz_cmd.mean().item()
+            print(f"  [WZ MIX] reset#{self._wz_reset_count//1000}k  "
+                  f"turning={_n_turn}/{_n_reset}({100*_n_turn/_n_reset:.0f}%)  "
+                  f"all_envs: mean={_all_mean:.4f}  std={_all_std:.4f}  "
+                  f"(target std≈0.063)")
+
         # Re-zero PhysX drive damping
         self._robot.write_joint_damping_to_sim(
             torch.zeros(n, 12, device=self.device), env_ids=env_ids)
@@ -853,7 +913,8 @@ class Go1Env(DirectRLEnv):
                     else f"Phase 1 (DR at step {_DELAY_PHASE1_END})")
             print(f"\n{'='*80}")
             print(f"[DEBUG] step {self._global_step} | {ph} | "
-                  f"cmd_vx={self.command_manager.command[idx,0]:.2f}")
+                  f"cmd_vx={self.command_manager.command[idx,0]:.2f}  "
+                  f"wz_cmd={self._wz_cmd[idx]:.3f}")
 
             kp0  = act.stiffness[0].cpu().numpy().round(1)
             kp1  = act.stiffness[1].cpu().numpy().round(1) if self.num_envs > 1 else kp0
