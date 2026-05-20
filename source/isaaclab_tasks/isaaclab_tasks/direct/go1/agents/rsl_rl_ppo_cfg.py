@@ -53,3 +53,40 @@ class Go1RslRlPpoCfg(RslRlOnPolicyRunnerCfg):
 # Use the same config for both flat and rough (just change task name)
 Go1FlatPPORunnerCfg = Go1RslRlPpoCfg
 Go1RoughPPORunnerCfg = Go1RslRlPpoCfg
+
+@configclass
+class Go1SparsePPORunnerCfg(RslRlOnPolicyRunnerCfg):
+    """Sparse emergent gait experiment — same network as flat, shorter run."""
+    seed = 42
+    device = "cuda:0"
+    num_steps_per_env = 24
+    max_iterations = 10000          # 10k fine-tune steps to observe gait shift
+    save_interval = 50              # frequent saves — gait transition may be abrupt
+    experiment_name = "go1_sparse_emergent"
+    run_name = "sparse_v1"
+    empirical_normalization = False
+    policy_obs_normalization = False
+
+    policy: RslRlPpoActorCriticCfg = RslRlPpoActorCriticCfg(
+        init_noise_std=0.1,
+        actor_hidden_dims=[512, 256, 128],
+        critic_hidden_dims=[512, 256, 128],
+        activation="elu",
+        actor_obs_normalization=True,
+        critic_obs_normalization=True,
+    )
+
+    algorithm: RslRlPpoAlgorithmCfg = RslRlPpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.001,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=1.0e-3,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=0.5,
+    )

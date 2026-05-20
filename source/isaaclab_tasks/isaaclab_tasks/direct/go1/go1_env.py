@@ -155,13 +155,14 @@ class Go1Env(DirectRLEnv):
         super().__init__(cfg, render_mode, **kwargs)
 
         print("\n" + "="*72)
-        print("Go1Env | v14: Mixed wz training (70% straight / 30% turning)")
-        print("  GATE: r_lin_vel × (0.30 + 0.70×gait_quality)  gait_quality∈[0,1]")
-        print("  n_contact=2(trot)→gate=1.0  n=3or1→gate=0.65  n=4or0→gate=0.30")
-        print("  ang_vel_xy: -0.08  |  46D obs: f_cmd~U[1.5,3.0]Hz")
+        print("Go1Env | v15: Improved wz training + FR_th rotation protection")
+        print("  WZ MIX:    50% straight / 50% turning  wz~U[-0.30,+0.30]")
+        print("  r_ang_vel: weight 0.5→1.0  (stronger wz tracking signal)")
+        print("  r_wz_excess: NEW — penalise yaw overshoot > 1.5×wz_cmd")
+        print("  r_fr_binding: wz-scaled  (-2.0 straight, -5.0 at max turn)")
+        print("  _episode_wz: persistent per episode (survives vx resampling)")
+        print("  → Normalizer wz std≈0.11  safe deploy ±0.20 rad/s")
         print(f"  Delay: Phase1 0ms → Phase2 U[0,8] at step {_DELAY_PHASE1_END}")
-        print("  WZ MIX: 70% envs wz=0 (straight), 30% envs wz~U[-0.20,+0.20]")
-        print("  → Normalizer will learn wz std≈0.063 → safe deploy range ±0.15")
         print("="*72 + "\n")
 
         _n    = self.num_envs
@@ -329,33 +330,36 @@ class Go1Env(DirectRLEnv):
         self._f_cmd_lo = 1.5   # Hz — lower bound of training range
         self._f_cmd_hi = 3.0   # Hz — upper bound (2× ratio, manageable variance)
 
-        # ── v14: Mixed wz command — per-episode bimodal distribution ─────────
-        # Problem: heading_command=True made wz converge to 0 immediately after
-        # heading alignment. Normalizer learned wz_std=0.0001 → any non-zero wz
-        # on real hardware is 1000× out of distribution → catastrophic falls.
+        # ── v15: Mixed wz command — improved 50/50 bimodal distribution ─────
+        # v14 used 70/30 — policy biased toward straight, ignored wz in 30% envs
+        # v15 uses 50/50 — equal time on straight and turning
         #
-        # Fix: heading_command=False + direct wz sampling each episode reset.
-        #   70% of envs: wz = 0.0    (straight walking — preserves stability)
-        #   30% of envs: wz ~ U[-0.20, +0.20] rad/s  (teaches turning)
+        # Wider range ±0.30 rad/s (was ±0.20):
+        #   Gives HL more steering authority on real hardware
+        #   RL_th stiction needs higher wz to overcome asymmetry
+        #   Expected normalizer std ≈ 0.30/√3/√2 ≈ 0.122 rad/s
+        #   On real hardware: wz=0.20 normalises to 0.20/0.122 = 1.64 → safe
         #
-        # Expected normalizer std ≈ 0.063 rad/s:
-        #   E[wz²] = 0.30 × (0.20²/3) = 0.004  →  std = √0.004 = 0.063
-        # On real hardware: wz=0.15 normalises to 0.15/0.063 = 2.4 → within range
-        # On real hardware: wz=0.20 normalises to 0.20/0.063 = 3.2 → near limit
-        # Recommended deploy range: ±0.15 rad/s  (safe with this training)
-        self._wz_cmd           = torch.zeros(_n, device=self.device)  # [N] per-env wz
-        self._WZ_STRAIGHT_PROB = 0.70    # fraction of envs with wz=0 each episode
-        self._WZ_MAX           = 0.20    # max turning rate [rad/s]
-        self._wz_reset_count   = 0       # for periodic debug prints
-        print(f"  [WZ MIX] STRAIGHT_PROB={self._WZ_STRAIGHT_PROB:.0%}  "
+        # _episode_wz: separate from _wz_cmd, persists through vx resampling
+        #   command_manager resamples vx every 5-10s mid-episode
+        #   _wz_cmd would survive (we override in _get_observations)
+        #   _episode_wz makes this explicit and immune to any command_manager state
+        self._wz_cmd           = torch.zeros(_n, device=self.device)
+        self._episode_wz       = torch.zeros(_n, device=self.device)  # persistent
+        self._WZ_STRAIGHT_PROB = 0.50    # was 0.70 — equal turning/straight
+        self._WZ_MAX           = 0.30    # was 0.20 — wider for real hardware
+        self._wz_reset_count   = 0
+        expected_std = self._WZ_MAX * (1.0 - self._WZ_STRAIGHT_PROB) ** 0.5 / 3.0**0.5
+        print(f"  [WZ MIX v15] STRAIGHT_PROB={self._WZ_STRAIGHT_PROB:.0%}  "
               f"WZ_MAX=±{self._WZ_MAX:.2f} rad/s  "
-              f"expected_std≈{self._WZ_MAX*(self._WZ_STRAIGHT_PROB*0.013)**0.5:.3f}")
+              f"expected_std≈{expected_std:.3f} rad/s  "
+              f"→ deploy safe range ±{2*expected_std:.3f} rad/s")
 
-        # ── Episode reward sums — v10: removed stance_time ───────────────
+        # ── Episode reward sums — v15: added wz_excess ───────────────────
         _rk = ["lin_vel", "ang_vel", "ang_vel_xy", "lin_vel_z", "torques",
                "action_rate", "action_jerk", "upright", "trot", "alive",
                "fall", "hip_reg", "hip_sat", "foot_clear", "foot_drag",
-               "lat_vel", "fr_binding"]
+               "lat_vel", "fr_binding", "wz_excess"]   # ← v15
         self._ep_sums = {k: torch.zeros(_n, device=self.device) for k in _rk}
 
         self._global_step = (_DELAY_PHASE1_END
@@ -479,10 +483,12 @@ class Go1Env(DirectRLEnv):
         pass
 
     # =========================================================================
-    # _get_observations — v14: 46D with wz override from mixed distribution
+    # _get_observations — v15: uses _episode_wz (persistent, survives resampling)
     # obs[0:3] = [vx_cmd, vy_cmd, wz_cmd]
-    #   vx, vy come from command_manager (unchanged)
-    #   wz comes from self._wz_cmd (bimodal: 70% zero, 30% ±0.20 rad/s)
+    #   vx, vy from command_manager (vx resamples every 5-10s, vy=0 always)
+    #   wz from self._episode_wz — set at episode reset, constant all episode
+    #   This ensures wz training is CONTINUOUS within each episode, not reset
+    #   by command_manager's mid-episode vx resampling.
     # obs[45] = gait freq cmd normalised
     # =========================================================================
     def _get_observations(self) -> dict:
@@ -490,14 +496,14 @@ class Go1Env(DirectRLEnv):
         f_cmd_norm = ((self._episode_f_cmd - self._f_cmd_lo)
                       / (self._f_cmd_hi - self._f_cmd_lo)).unsqueeze(1)  # [N,1]
 
-        # Build cmd obs: vx/vy from command_manager, wz from mixed distribution
-        # heading_command=False → command_manager wz is ~0 (cfg: ±0.0001)
-        # We override obs[2] with our bimodal _wz_cmd
+        # Build cmd obs: vx/vy from command_manager, wz from _episode_wz
+        # _episode_wz is set once at episode reset and stays constant all episode
+        # This gives the LL a consistent, uninterrupted wz training signal
         cmd_obs = self.command_manager.command[:, :3].clone()   # [N, 3]
-        cmd_obs[:, 2] = self._wz_cmd                            # override wz ← key change
+        cmd_obs[:, 2] = self._episode_wz                        # override wz ← v15
 
         obs = torch.cat([
-            cmd_obs,                                                       # [0:3] vx/vy/wz
+            cmd_obs,                                                       # [0:3]
             self._robot.data.joint_pos - self._robot.data.default_joint_pos,  # [3:15]
             torch.clamp(self._robot.data.joint_vel,      -5.0, 5.0),      # [15:27]
             torch.clamp(self._robot.data.root_ang_vel_b, -5.0, 5.0),      # [27:30]
@@ -510,8 +516,17 @@ class Go1Env(DirectRLEnv):
         return {"policy": obs}
 
     # =========================================================================
-    # _get_rewards — v14: r_ang_vel uses self._wz_cmd (mixed distribution)
-    # All other rewards unchanged from v13
+    # _get_rewards — v15: stronger wz tracking + FR_th rotation protection
+    # Changes from v14:
+    #   r_ang_vel:    weight 0.5 → 1.0  (stronger signal to learn turning)
+    #   r_wz_excess:  NEW — penalise yaw rate exceeding 1.5×|wz_cmd|
+    #                 Suppresses "soldier-march" overreaction seen in HL play test
+    #                 At wz=0:     no penalty (straight walking unchanged)
+    #                 At wz=0.30:  yaw_rate > 0.45 rad/s → penalty fires
+    #   r_fr_binding: wz-scaled — stricter FR_th protection during turns
+    #                 wz=0:    -2.0 × fr_prox²  (unchanged from v13)
+    #                 wz=±0.30: -5.0 × fr_prox²  (3× stricter at max turn)
+    #                 Prevents FR_th binding zone during aggressive rotation
     # =========================================================================
     def _get_rewards(self):
         lin_vel = self._robot.data.root_lin_vel_b
@@ -547,10 +562,21 @@ class Go1Env(DirectRLEnv):
         # ── Velocity tracking — gated by gait quality ─────────────────────
         r_lin_vel_raw = 1.5 * torch.exp(-(lin_vel[:, 0] - cmd[:, 0])**2 / 0.25)
         r_lin_vel     = r_lin_vel_raw * gait_gate   # ← gate applied here
-        # v14: r_ang_vel uses self._wz_cmd (bimodal mixed distribution)
-        # NOT cmd[:, 2] — command_manager wz is ~0 (heading_command=False cfg)
-        # self._wz_cmd is the actual wz target set in _reset_idx per episode
-        r_ang_vel     = 0.5 * torch.exp(-(ang_vel[:, 2] - self._wz_cmd)**2 / 0.25)
+
+        # v15: r_ang_vel uses _episode_wz (persistent per episode)
+        #   Weight 0.5 → 1.0: stronger signal so LL actively learns to turn
+        #   _episode_wz is the per-episode wz target (50% zero, 50% ±0.30)
+        r_ang_vel = 1.0 * torch.exp(-(ang_vel[:, 2] - self._episode_wz)**2 / 0.25)
+
+        # v15 NEW: yaw overshoot penalty — suppresses soldier-march overreaction
+        #   HL play test showed yaw_rate 2.7-8.6× the commanded wz
+        #   Root cause: RL_th stiction escape creates impulsive yaw
+        #   Fix: penalise yaw_rate that exceeds 1.5× the commanded magnitude
+        #   At wz=0:    no penalty (abs(yaw) > 0 gives gentle damping)
+        #   At wz=0.30: yaw_rate must stay < 0.45 rad/s (1.5×0.30)
+        wz_excess    = torch.clamp(
+            ang_vel[:, 2].abs() - self._episode_wz.abs() * 1.5, min=0.0)
+        r_wz_excess  = -0.5 * wz_excess**2
 
         # ── Velocity-gated alive — forward-only (vx ≥ 0 always in v12+) ──
         vel_gate = torch.clamp(lin_vel[:, 0] / 0.2, 0.0, 1.0)
@@ -681,21 +707,33 @@ class Go1Env(DirectRLEnv):
             foot_speed_xy = torch.norm(foot_vel[:, :, :2], dim=-1)
             r_foot_drag   = -1.0 * torch.sum(feet_contact * foot_speed_xy, dim=1)
 
-        # ── FR_th binding proximity penalty ──────────────────────────────
-        fr_th_q      = self._robot.data.joint_pos[:, 5]
-        fr_prox      = torch.clamp((fr_th_q - 0.800) / 0.070, 0.0, 1.0)
-        r_fr_binding = -2.0 * fr_prox ** 2
+        # ── FR_th binding proximity penalty — v15: wz-scaled ─────────────
+        # Standard: -2.0 × fr_prox²  (same as v13 for straight walking)
+        # During turns: penalty scales up to -5.0 × fr_prox² at max wz
+        #
+        # WHY: During rotation the FR leg generates asymmetric force.
+        #   RL_th stiction forces impulsive commands → FR_th absorbs compensation.
+        #   Without extra penalty, FR_th drifts toward 0.820 binding zone.
+        #   With wz-scaled penalty: policy learns to keep FR_th clear during turns.
+        #   Real hardware: FR_th cap (0.820) still hard limits target position.
+        #   This reward ensures the APPROACH to 0.820 is slow/careful during wz.
+        fr_th_q  = self._robot.data.joint_pos[:, 5]
+        fr_prox  = torch.clamp((fr_th_q - 0.800) / 0.070, 0.0, 1.0)
+        # wz_scale: 0.0 at wz=0 (straight), 1.0 at wz=±_WZ_MAX (max turn)
+        wz_scale = torch.clamp(self._episode_wz.abs() / self._WZ_MAX, 0.0, 1.0)
+        # Penalty: -2.0 (straight) to -5.0 (max turn)
+        r_fr_binding = -(2.0 + 3.0 * wz_scale) * fr_prox ** 2
 
         # ── Episode sum tracking ──────────────────────────────────────────
         for k, v in zip(
             ["lin_vel", "ang_vel", "ang_vel_xy", "lin_vel_z", "torques",
              "action_rate", "action_jerk", "upright", "trot", "alive",
              "fall", "hip_reg", "hip_sat", "foot_clear", "foot_drag",
-             "lat_vel", "fr_binding"],
+             "lat_vel", "fr_binding", "wz_excess"],
             [r_lin_vel, r_ang_vel, r_ang_vel_xy, r_lin_vel_z, r_torques,
              r_action_rate, r_action_jerk, r_upright, r_trot, r_alive,
              r_fall, r_hip_reg, r_hip_sat, r_foot_clear, r_foot_drag,
-             r_lat_vel, r_fr_binding]
+             r_lat_vel, r_fr_binding, r_wz_excess]
         ):
             self._ep_sums[k] += v
 
@@ -706,7 +744,7 @@ class Go1Env(DirectRLEnv):
             + r_upright   + r_trot        + r_alive
             + r_hip_reg   + r_hip_sat
             + r_foot_clear + r_foot_drag
-            + r_lat_vel   + r_fr_binding
+            + r_lat_vel   + r_fr_binding  + r_wz_excess    # ← v15: wz_excess added
         ) + r_fall
 
     # =========================================================================
@@ -741,28 +779,34 @@ class Go1Env(DirectRLEnv):
         super()._reset_idx(env_ids)
         self.command_manager.reset(env_ids)
 
-        # ── v14: Mixed wz assignment — bimodal per episode ───────────────
-        # 70% of resetting envs: wz = 0.0 (straight walking)
-        # 30% of resetting envs: wz ~ U[-0.20, +0.20] rad/s (turning)
-        # This is assigned once per episode at reset and held constant.
-        # Consistent with heading_command=False in cfg (command_manager wz≈0).
-        # The reward r_ang_vel in _get_rewards tracks self._wz_cmd, not cmd[:,2].
+        # ── v15: Mixed wz assignment — 50/50, ±0.30, _episode_wz ────────
+        # v14: 70/30 split, ±0.20 — policy biased toward straight, weak turns
+        # v15: 50/50 split, ±0.30 — equal training on straight and turning
+        #
+        # _episode_wz: separate buffer from _wz_cmd, set here at reset.
+        # _get_observations reads _episode_wz, NOT _wz_cmd.
+        # This ensures wz is continuous and constant throughout the full episode
+        # even if command_manager resamples vx mid-episode.
+        # r_ang_vel and r_fr_binding both use _episode_wz in _get_rewards.
         _n_reset    = len(env_ids)
         _is_turning = torch.rand(_n_reset, device=self.device) >= self._WZ_STRAIGHT_PROB
         _wz_turn    = (torch.rand(_n_reset, device=self.device) * 2.0 - 1.0) * self._WZ_MAX
-        self._wz_cmd[env_ids] = torch.where(
+        _wz_assign  = torch.where(
             _is_turning, _wz_turn, torch.zeros(_n_reset, device=self.device))
+        self._wz_cmd[env_ids]     = _wz_assign   # keep for debug compatibility
+        self._episode_wz[env_ids] = _wz_assign   # persistent per episode
 
         # Debug: print wz distribution every ~50k env-resets
         self._wz_reset_count += _n_reset
         if self._wz_reset_count % 50000 < _n_reset:
             _n_turn  = _is_turning.sum().item()
-            _all_std = self._wz_cmd.std().item()
-            _all_mean= self._wz_cmd.mean().item()
-            print(f"  [WZ MIX] reset#{self._wz_reset_count//1000}k  "
+            _all_std = self._episode_wz.std().item()
+            _all_mean= self._episode_wz.mean().item()
+            expected_std = self._WZ_MAX * (1.0 - self._WZ_STRAIGHT_PROB)**0.5 / 3.0**0.5
+            print(f"  [WZ MIX v15] reset#{self._wz_reset_count//1000}k  "
                   f"turning={_n_turn}/{_n_reset}({100*_n_turn/_n_reset:.0f}%)  "
                   f"all_envs: mean={_all_mean:.4f}  std={_all_std:.4f}  "
-                  f"(target std≈0.063)")
+                  f"target={expected_std:.4f}  deploy_safe=±{2*expected_std:.3f}")
 
         # Re-zero PhysX drive damping
         self._robot.write_joint_damping_to_sim(
@@ -914,7 +958,8 @@ class Go1Env(DirectRLEnv):
             print(f"\n{'='*80}")
             print(f"[DEBUG] step {self._global_step} | {ph} | "
                   f"cmd_vx={self.command_manager.command[idx,0]:.2f}  "
-                  f"wz_cmd={self._wz_cmd[idx]:.3f}")
+                  f"episode_wz={self._episode_wz[idx]:.3f}  "
+                  f"({'TURNING' if abs(self._episode_wz[idx].item())>0.02 else 'STRAIGHT'})")
 
             kp0  = act.stiffness[0].cpu().numpy().round(1)
             kp1  = act.stiffness[1].cpu().numpy().round(1) if self.num_envs > 1 else kp0

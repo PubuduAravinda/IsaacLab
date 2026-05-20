@@ -4,6 +4,9 @@ from . import agents  # Your agents folder (contains rsl_rl_ppo_cfg.py)
 
 from isaaclab_tasks.direct.go1.go1_nav_env_cfg import Go1NavEnvCfg
 
+# from .agents.rsl_rl_ppo_cfg import Go1FlatPPORunnerCfg, Go1SparsePPORunnerCfg
+# from .go1_env_sparse import Go1EnvSparse
+
 gym.register(
     id="Isaac-Go1-Nav-v0",
     entry_point="isaaclab_tasks.direct.go1.go1_nav_env:Go1NavEnv",
@@ -12,6 +15,16 @@ gym.register(
         "env_cfg_entry_point": "isaaclab_tasks.direct.go1.go1_nav_env_cfg:Go1NavEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Go1RslRlPpoCfg",
     },
+)
+
+gym.register(
+    id="Isaac-Go1-Sparse-Direct-v0",
+    entry_point="isaaclab_tasks.direct.go1.go1_env_sparse:Go1EnvSparse",
+    kwargs={
+        "env_cfg_entry_point": "isaaclab_tasks.direct.go1.go1_env_cfg:Go1FlatEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Go1SparsePPORunnerCfg",
+    },
+    disable_env_checker=True,
 )
 
 gym.register(
