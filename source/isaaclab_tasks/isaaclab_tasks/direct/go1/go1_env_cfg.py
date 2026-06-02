@@ -191,7 +191,7 @@ class Go1SceneCfg(InteractiveSceneCfg):
         prim_path="{ENV_REGEX_NS}/Robot/.*_foot",
         update_period=0.005,
         history_length=3,
-        debug_vis=False,
+        debug_vis=True,
         track_air_time=True,
     )
 
@@ -229,7 +229,7 @@ class Go1FlatEnvCfg(DirectRLEnvCfg):
         resampling_time_range=(5.0, 10.0),
         debug_vis=False,
         ranges=mdp.commands.UniformVelocityCommandCfg.Ranges(
-            lin_vel_x=(0.3, 0.9),
+            lin_vel_x=(0.3, 1.0),
             lin_vel_y=(0.0, 0.0),
             ang_vel_z=(-0.0001, 0.0001),      # yaw=0 → prevents spinning exploit
             heading=(-np.pi / 8, np.pi / 8),

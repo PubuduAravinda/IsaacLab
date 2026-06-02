@@ -73,21 +73,39 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
 
     # ── Always rebuild Go1 cfg for play ──────────────────────────────────────
     is_go1 = "go1" in args_cli.task.lower()
+    is_rough = "rough" in args_cli.task.lower()
+
     if is_go1:
-        env_cfg   = Go1FlatEnvCfg()
-        agent_cfg = Go1RslRlPpoCfg()
+        if is_rough:
+            from isaaclab_tasks.direct.go1.go1_rough_env_cfg import (
+                Go1RoughEnvCfg, make_rough_scene, TERRAIN_TOTAL_PATCHES)
+            env_cfg = Go1RoughEnvCfg()
+            agent_cfg = Go1RslRlPpoCfg()
+            print("[PLAY] Go1 ROUGH task")
+        else:
+            env_cfg = Go1FlatEnvCfg()
+            agent_cfg = Go1RslRlPpoCfg()
+            print("[PLAY] Go1 FLAT task")
+
         if args_cli.device is not None:
             env_cfg.sim.device = args_cli.device
-            agent_cfg.device   = args_cli.device
+            agent_cfg.device = args_cli.device
 
     # For play: 1 env is enough. Change num_envs class field in go1_env_cfg.py
     # before running play if you want more. CLI --num_envs also works here
     # because we're just overriding scene.num_envs after fresh construction.
-    if args_cli.num_envs is not None:
-        env_cfg.num_envs        = args_cli.num_envs
-        env_cfg.scene.num_envs  = args_cli.num_envs
-        env_cfg.scene.env_spacing = 4.0
-        print(f"[PLAY] num_envs overridden to {args_cli.num_envs}")
+    if is_rough:
+        # Rebuild scene to avoid @configclass num_envs freeze → stacking
+        _n = args_cli.num_envs if args_cli.num_envs is not None else TERRAIN_TOTAL_PATCHES
+        env_cfg.scene = make_rough_scene(_n)
+        env_cfg.scene.num_envs = _n
+        print(f"[PLAY] Rough scene: {_n} envs  ({TERRAIN_TOTAL_PATCHES} patches)")
+    else:
+        if args_cli.num_envs is not None:
+            env_cfg.num_envs = args_cli.num_envs
+            env_cfg.scene.num_envs = args_cli.num_envs
+            env_cfg.scene.env_spacing = 4.0
+            print(f"[PLAY] num_envs overridden to {args_cli.num_envs}")
 
     # ── Checkpoint path ───────────────────────────────────────────────────────
     log_root_path = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))

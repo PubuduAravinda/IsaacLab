@@ -47,12 +47,24 @@ gym.register(
     entry_point="isaaclab_tasks.direct.go1.go1_env:Go1Env",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": "isaaclab_tasks.direct.go1.go1_env_cfg:Go1RoughEnvCfg",
-        # Optional: rl_games for rough
-        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_rough_ppo_cfg.yaml",
-        # Same RSL_RL config works for both flat and rough (as recommended)
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Go1RslRlPpoCfg",
-        # Keep skrl if needed
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
+        "env_cfg_entry_point":
+            "isaaclab_tasks.direct.go1.go1_rough_env_cfg:Go1RoughEnvCfg",
+        "rsl_rl_cfg_entry_point":
+            f"{agents.__name__}.rsl_rl_ppo_cfg:Go1RslRlPpoCfg",
     },
 )
+
+# gym.register(
+#     id="Isaac-Velocity-Rough-Go1-Direct-v0",
+#     entry_point="isaaclab_tasks.direct.go1.go1_env:Go1Env",
+#     disable_env_checker=True,
+#     kwargs={
+#         "env_cfg_entry_point": "isaaclab_tasks.direct.go1.go1_env_cfg:Go1RoughEnvCfg",
+#         # Optional: rl_games for rough
+#         "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_rough_ppo_cfg.yaml",
+#         # Same RSL_RL config works for both flat and rough (as recommended)
+#         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Go1RslRlPpoCfg",
+#         # Keep skrl if needed
+#         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
+#     },
+# )

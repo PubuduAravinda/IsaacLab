@@ -101,27 +101,58 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     # ── Go1 task: rebuild cfg from scratch ───────────────────────────────────
     # @configclass bakes scene(num_envs) at class definition time.
     # Detect sparse vs flat to select the correct PPO runner cfg.
-    is_go1    = "go1"    in args_cli.task.lower()
+    is_go1 = "go1" in args_cli.task.lower()
     is_sparse = "sparse" in args_cli.task.lower()
+    is_rough = "rough" in args_cli.task.lower()  # ← ADD
 
     if is_go1:
         if is_sparse:
-            env_cfg   = Go1FlatEnvCfg()          # same physics/scene as flat
-            agent_cfg = Go1SparsePPORunnerCfg()  # 10k iters, sparse experiment name
+            env_cfg = Go1FlatEnvCfg()
+            agent_cfg = Go1SparsePPORunnerCfg()
             print("[INFO] Go1 SPARSE task — Go1FlatEnvCfg + Go1SparsePPORunnerCfg")
+
+        elif is_rough:
+            from isaaclab_tasks.direct.go1.go1_rough_env_cfg import (
+                Go1RoughEnvCfg, make_rough_scene, TERRAIN_TOTAL_PATCHES)
+            env_cfg = Go1RoughEnvCfg()
+            agent_cfg = Go1RslRlPpoCfg()
+            print("[INFO] Go1 ROUGH task — Go1RoughEnvCfg + Go1RslRlPpoCfg")
+
         else:
-            env_cfg   = Go1FlatEnvCfg()
+            env_cfg = Go1FlatEnvCfg()
             agent_cfg = Go1RslRlPpoCfg()
             print("[INFO] Go1 FLAT task — Go1FlatEnvCfg + Go1RslRlPpoCfg")
 
-        # Re-apply CLI overrides after cfg rebuild
+        # Re-apply CLI overrides
         if args_cli.device is not None:
             env_cfg.sim.device = args_cli.device
-            agent_cfg.device   = args_cli.device
+            agent_cfg.device = args_cli.device
         if args_cli.max_iterations is not None:
             agent_cfg.max_iterations = args_cli.max_iterations
-        if args_cli.num_envs is not None:
-            env_cfg.scene.num_envs = args_cli.num_envs
+
+        if is_rough:
+            # ── STACKING FIX ────────────────────────────────────────────────
+            # Rebuild scene with correct num_envs BEFORE gym.make().
+            # @configclass freezes scene(num_envs=1) at class definition time.
+            # make_rough_scene(N) constructs fresh so terrain assigns N origins.
+            _n = args_cli.num_envs if args_cli.num_envs is not None \
+                else TERRAIN_TOTAL_PATCHES
+            env_cfg.scene = make_rough_scene(_n)
+            env_cfg.scene.num_envs = _n
+            print(f"[INFO] Rough scene rebuilt for {_n} envs  "
+                  f"({TERRAIN_TOTAL_PATCHES} patches, "
+                  f"{_n / TERRAIN_TOTAL_PATCHES:.1f} envs/patch)")
+            if _n > TERRAIN_TOTAL_PATCHES:
+                print(f"[INFO] >{TERRAIN_TOTAL_PATCHES} envs → "
+                      f"{_n / TERRAIN_TOTAL_PATCHES:.1f} per patch "
+                      f"(intentional for training)")
+            else:
+                print(f"[INFO] ≤{TERRAIN_TOTAL_PATCHES} envs → "
+                      f"1 env/patch (no stacking) ✓")
+        else:
+            # Flat / sparse: standard num_envs override
+            if args_cli.num_envs is not None:
+                env_cfg.scene.num_envs = args_cli.num_envs
 
         print(f"[INFO] num_envs={env_cfg.scene.num_envs}  "
               f"max_iters={agent_cfg.max_iterations}  "

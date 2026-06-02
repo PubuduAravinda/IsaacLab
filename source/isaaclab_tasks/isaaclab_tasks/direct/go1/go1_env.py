@@ -155,13 +155,13 @@ class Go1Env(DirectRLEnv):
         super().__init__(cfg, render_mode, **kwargs)
 
         print("\n" + "="*72)
-        print("Go1Env | v15: Improved wz training + FR_th rotation protection")
-        print("  WZ MIX:    50% straight / 50% turning  wz~U[-0.30,+0.30]")
-        print("  r_ang_vel: weight 0.5→1.0  (stronger wz tracking signal)")
-        print("  r_wz_excess: NEW — penalise yaw overshoot > 1.5×wz_cmd")
+        print("Go1Env | v15-terrain: Outdoor terrain + wz rotation")
+        print("  WZ MIX:       50% straight / 50% turning  wz~U[-0.30,+0.30]")
+        print("  r_ang_vel:    weight 1.0  (stronger wz tracking)")
+        print("  r_wz_excess:  penalise yaw overshoot > 1.5×wz_cmd")
         print("  r_fr_binding: wz-scaled  (-2.0 straight, -5.0 at max turn)")
-        print("  _episode_wz: persistent per episode (survives vx resampling)")
-        print("  → Normalizer wz std≈0.11  safe deploy ±0.20 rad/s")
+        print("  TERRAIN:      height-relative done/reward checks")
+        print("                per-episode friction DR [0.35, 0.80]")
         print(f"  Delay: Phase1 0ms → Phase2 U[0,8] at step {_DELAY_PHASE1_END}")
         print("="*72 + "\n")
 
@@ -355,6 +355,26 @@ class Go1Env(DirectRLEnv):
               f"expected_std≈{expected_std:.3f} rad/s  "
               f"→ deploy safe range ±{2*expected_std:.3f} rad/s")
 
+        # ── Terrain height offsets ──────────────────────────────────────────
+        # For flat terrain: all zeros (no effect).
+        # For rough terrain (Go1RoughEnvCfg): scene.env_origins[:, 2] gives
+        # the Z height of each env's origin ON the terrain.
+        # Used in _get_dones and _get_rewards for height-relative checks.
+        # Must be read AFTER super().__init__() which populates env_origins.
+        self._terrain_z = self.scene.env_origins[:, 2].clone()   # [N]
+        is_rough = self._terrain_z.abs().max().item() > 0.01
+        print(f"  [TERRAIN] {'ROUGH — height-relative checks active' if is_rough else 'FLAT — terrain_z≈0'}")
+
+        # ── Per-episode friction DR bounds ─────────────────────────────────
+        # Flat cfg: friction_range_lo/hi not present → use flat defaults
+        # Rough cfg (Go1RoughEnvCfg): uses [0.35, 0.80] for mud→dry grass
+        self._friction_lo = float(getattr(cfg, 'friction_range_lo', 0.70))
+        self._friction_hi = float(getattr(cfg, 'friction_range_hi', 0.80))
+        self._friction_dr_enabled = abs(self._friction_hi - self._friction_lo) > 0.05
+        if self._friction_dr_enabled:
+            print(f"  [FRICTION DR] range=[{self._friction_lo:.2f}, {self._friction_hi:.2f}]"
+                  f"  (per-episode terrain friction)")
+
         # ── Episode reward sums — v15: added wz_excess ───────────────────
         _rk = ["lin_vel", "ang_vel", "ang_vel_xy", "lin_vel_z", "torques",
                "action_rate", "action_jerk", "upright", "trot", "alive",
@@ -430,6 +450,214 @@ class Go1Env(DirectRLEnv):
     # =========================================================================
     def _setup_scene(self):
         self._robot = self.scene["robot"]
+
+        # ── Lighting ──────────────────────────────────────────────────────
+        # Spawn a strong directional sun + fill light so terrain is visible.
+        # DomeLightCfg cannot go in scene cfg (InteractiveScene rejects it).
+        # spawn_light works here because USD stage is ready at _setup_scene time.
+        import isaaclab.sim as sim_utils
+        import omni.usd
+        try:
+            from pxr import UsdLux, Gf
+            stage = omni.usd.get_context().get_stage()
+
+            # Sun — distant directional light
+            sun_prim = stage.DefinePrim("/World/Lights/SunLight", "DistantLight")
+            sun      = UsdLux.DistantLight(sun_prim)
+            sun.CreateIntensityAttr(10000.0)
+            sun.CreateColorAttr(Gf.Vec3f(1.0, 0.97, 0.90))
+            sun.CreateAngleAttr(0.53)
+            from pxr import UsdGeom
+            UsdGeom.Xformable(sun_prim).MakeMatrixXform().Set(
+                Gf.Matrix4d().SetRotate(
+                    Gf.Rotation(Gf.Vec3d(1, 0.2, 0.1), 45.0)))
+
+            # Sky dome — ambient fill
+            sky_prim = stage.DefinePrim("/World/Lights/SkyLight", "DomeLight")
+            sky      = UsdLux.DomeLight(sky_prim)
+            sky.CreateIntensityAttr(1500.0)
+            sky.CreateColorAttr(Gf.Vec3f(0.6, 0.7, 0.95))   # sky blue fill
+            print("[LIGHT] Sun + SkyDome spawned ✓")
+        except Exception as e:
+            print(f"[LIGHT] USD lights not available ({e}) — using sim default")
+            try:
+                # Fallback: use Isaac Lab helper
+                _dome = sim_utils.DomeLightCfg(intensity=3000.0,
+                                               color=(0.85, 0.88, 1.0))
+                _dome.func("/World/Lights/SkyLight", _dome)
+                print("[LIGHT] DomeLightCfg fallback spawned ✓")
+            except Exception as e2:
+                print(f"[LIGHT] All light methods failed ({e2})")
+
+        # ── Terrain colour via sim_utils.PreviewSurfaceCfg ────────────────
+        # Raw UsdShade.Material shows white because the terrain importer's
+        # own physics material overrides it in RTX mode.
+        # sim_utils.PreviewSurfaceCfg is the same mechanism used by
+        # VisualizationMarkers (markers show colour → this will too).
+        # Each terrain TYPE gets a distinct colour so types are distinguishable.
+        try:
+            import isaaclab.sim as sim_utils
+            import omni.usd
+            from pxr import UsdGeom, UsdShade, Sdf
+
+            stage = omni.usd.get_context().get_stage()
+
+            # (R,G,B) linear colour per terrain type keyword in prim path
+            COLOR_MAP = {
+                "flat"         : (0.72, 0.72, 0.72),   # light grey
+                "gravel_light" : (0.75, 0.65, 0.48),   # sandy beige
+                "gravel_heavy" : (0.48, 0.44, 0.36),   # dark grey-brown
+                "grass_wave"   : (0.15, 0.50, 0.12),   # grass green
+                "slope_gentle" : (0.78, 0.68, 0.30),   # sandy yellow
+                "slope_steep"  : (0.52, 0.38, 0.18),   # rock brown
+                "obstacles"    : (0.42, 0.28, 0.15),   # dark brown
+                "_default_"    : (0.60, 0.60, 0.60),   # fallback mid-grey
+            }
+
+            _mat_cache = {}
+            _mat_root  = "/World/TerrainMats"
+            _bound = 0
+            _paths_seen = []
+
+            for prim in stage.Traverse():
+                path = str(prim.GetPath())
+                if not prim.IsA(UsdGeom.Mesh):
+                    continue
+                # Only target terrain meshes
+                if "/World/ground" not in path and "/terrain" not in path.lower():
+                    continue
+                _paths_seen.append(path)
+
+                # Pick colour by keyword match in path
+                path_lower = path.lower()
+                chosen_key = "_default_"
+                for key in COLOR_MAP:
+                    if key != "_default_" and key in path_lower:
+                        chosen_key = key
+                        break
+                col = COLOR_MAP[chosen_key]
+
+                # Create/reuse material using Isaac Lab's PreviewSurfaceCfg
+                if chosen_key not in _mat_cache:
+                    mat_path   = f"{_mat_root}/{chosen_key.strip('_')}"
+                    mat_cfg    = sim_utils.PreviewSurfaceCfg(
+                        diffuse_color = col,
+                        roughness     = 0.85,
+                        metallic      = 0.0,
+                    )
+                    # Spawn the material — same API that colours markers
+                    spawned = mat_cfg.func(mat_path, mat_cfg)
+                    _mat_cache[chosen_key] = spawned
+
+                # Bind to this mesh
+                if _mat_cache[chosen_key] is not None:
+                    UsdShade.MaterialBindingAPI(prim).Bind(
+                        _mat_cache[chosen_key],
+                        UsdShade.Tokens.weakerThanDescendants)
+                    _bound += 1
+
+            print(f"[TERRAIN COLOURS] Bound to {_bound} mesh prims "
+                  f"({len(_paths_seen)} terrain prims found)")
+            if _bound == 0 and _paths_seen:
+                print(f"  ⚠ Prims found but no colour matched. "
+                      f"Sample paths: {_paths_seen[:3]}")
+                print(f"  → Add matching keywords to COLOR_MAP in _setup_scene")
+            elif _bound == 0:
+                print(f"  ⚠ No terrain mesh prims found under /World/ground")
+                print(f"  → Open Stage panel, expand ground prim, "
+                      f"check path and tell me the structure")
+        except Exception as e:
+            print(f"[TERRAIN COLOURS] Skipped ({e})")
+
+        # ── Terrain type labels — floating coloured poles above each patch ──
+        # Visible in viewport as tall thin cylinders, one per terrain type.
+        # Colour matches terrain material. Height = unique per type for ID.
+        # Legend printed to console for reference.
+        #
+        # Pole heights (easy to see in viewport):
+        #   flat=0.5m  gravel_light=1.0m  gravel_heavy=1.5m  grass_wave=2.0m
+        #   slope_gentle=2.5m  obstacles=3.0m  slope_steep=3.5m
+        try:
+            import isaaclab.sim as sim_utils
+            LABEL_INFO = {
+                # terrain_key: (height_m, colour_rgb, legend_text)
+                "flat"         : (0.5,  (0.72, 0.72, 0.72), "FLAT — smooth"),
+                "gravel_light" : (1.0,  (0.75, 0.65, 0.48), "GRAVEL LIGHT — ±2-4cm"),
+                "gravel_heavy" : (1.5,  (0.48, 0.44, 0.36), "GRAVEL HEAVY — ±5-8cm"),
+                "grass_wave"   : (2.0,  (0.15, 0.50, 0.12), "GRASS WAVE — rolling"),
+                "slope_gentle" : (2.5,  (0.78, 0.68, 0.30), "SLOPE GENTLE — 3-12°"),
+                "obstacles"    : (3.0,  (0.42, 0.28, 0.15), "OBSTACLES — 3-12cm"),
+                "slope_steep"  : (3.5,  (0.52, 0.38, 0.18), "SLOPE STEEP — 12-20°"),
+            }
+            import omni.usd
+            from pxr import UsdGeom, Gf, UsdShade, Sdf
+            stage = omni.usd.get_context().get_stage()
+            _poles_created = 0
+
+            # Find terrain patch centre positions from stage
+            _patch_positions = {}  # terrain_key → first patch XYZ
+            for prim in stage.Traverse():
+                path = str(prim.GetPath())
+                if "/World/ground" not in path:
+                    continue
+                if not prim.IsA(UsdGeom.Mesh):
+                    continue
+                for key in LABEL_INFO:
+                    if key in path.lower() and key not in _patch_positions:
+                        # Get world position of this mesh prim
+                        xf = UsdGeom.Xformable(prim)
+                        if xf:
+                            bbox = xf.ComputeLocalToWorldTransform(0)
+                            pos  = Gf.Vec3f(float(bbox[3][0]),
+                                            float(bbox[3][1]),
+                                            float(bbox[3][2]))
+                            _patch_positions[key] = pos
+                        break
+
+            # Create one thin cylinder pole per terrain type at patch centre
+            for key, (height, col, legend) in LABEL_INFO.items():
+                if key not in _patch_positions:
+                    continue
+                pos     = _patch_positions[key]
+                pole_path = f"/World/TerrainLabels/{key}_pole"
+                pole    = UsdGeom.Cylinder.Define(stage, pole_path)
+                pole.GetRadiusAttr().Set(0.05)        # 5cm radius — thin
+                pole.GetHeightAttr().Set(float(height))
+                pole.GetAxisAttr().Set("Z")
+                # Place pole at patch centre, raised to half-height
+                from pxr import UsdGeom as _ug
+                xform = _ug.XformCommonAPI(pole)
+                xform.SetTranslate(Gf.Vec3d(
+                    float(pos[0]),
+                    float(pos[1]),
+                    float(pos[2]) + height * 0.5 + 0.5))   # 0.5m above ground
+                # Colour the pole
+                mat_path = f"/World/TerrainMats/{key}_pole_mat"
+                mat      = UsdShade.Material.Define(stage, mat_path)
+                shader   = UsdShade.Shader.Define(stage, f"{mat_path}/Shader")
+                shader.CreateIdAttr("UsdPreviewSurface")
+                shader.CreateInput("diffuseColor",
+                                   Sdf.ValueTypeNames.Color3f).Set(
+                    Gf.Vec3f(*col))
+                shader.CreateInput("roughness",
+                                   Sdf.ValueTypeNames.Float).Set(0.5)
+                mat.CreateSurfaceOutput().ConnectToSource(
+                    shader.ConnectableAPI(), "surface")
+                UsdShade.MaterialBindingAPI(pole).Bind(mat)
+                _poles_created += 1
+
+            if _poles_created:
+                print(f"[TERRAIN LABELS] {_poles_created} marker poles created")
+                print("  Legend (pole height → terrain type):")
+                for key, (h, c, legend) in LABEL_INFO.items():
+                    if key in _patch_positions:
+                        print(f"    {h:.1f}m pole → {legend}")
+            else:
+                print("[TERRAIN LABELS] No poles — terrain patches not found "
+                      "(only works with rough terrain task)")
+        except Exception as e:
+            print(f"[TERRAIN LABELS] Skipped ({e})")
+
         print("─"*60 + "\nACTUATOR VERIFICATION\n" + "─"*60)
         for name, act in (getattr(self._robot, "_actuators", None) or {}).items():
             kp = getattr(act, "stiffness",       None)
@@ -578,21 +806,24 @@ class Go1Env(DirectRLEnv):
             ang_vel[:, 2].abs() - self._episode_wz.abs() * 1.5, min=0.0)
         r_wz_excess  = -0.5 * wz_excess**2
 
-        # ── Velocity-gated alive — forward-only (vx ≥ 0 always in v12+) ──
+        # ── Terrain-relative height ────────────────────────────────────────
+        # Flat terrain: _terrain_z=0 → height_rel = height (no change)
+        # Rough terrain: height_rel removes the terrain floor variation
+        # so alive/fall checks are consistent across all terrain types.
+        height_rel = height - self._terrain_z
+
+        # ── Velocity-gated alive — terrain-relative ─────────────────────
         vel_gate = torch.clamp(lin_vel[:, 0] / 0.2, 0.0, 1.0)
-        r_alive  = 0.3 * vel_gate * ((height > 0.28) & (tilt < 0.3)).float()
+        r_alive  = 0.3 * vel_gate * ((height_rel > 0.26) & (tilt < 0.3)).float()
 
         # ── Standard penalties ────────────────────────────────────────────
-        # r_ang_vel_xy: reverted from -0.15 back to -0.08.
-        # -0.15 was too strong: created compensatory rapid angular corrections
-        # (RMS body angular velocity rose to 0.69 rad/s, causing oscillation loop).
-        # -0.08 gives meaningful trunk damping without driving reactive overshoots.
+        # r_ang_vel_xy: -0.08 (same as v13-15).
         r_ang_vel_xy = -0.08 * (ang_vel[:, 0]**2 + ang_vel[:, 1]**2)
         r_lin_vel_z  = -4.0  * lin_vel[:, 2]**2
         r_torques    = -1e-5 * torch.sum(
             self._robot.data.applied_torque**2, dim=1)
-        r_fall       = -10.0 * (height < 0.25).float()
-        r_upright    = -3.5  * (gravity[:, 0]**2 + gravity[:, 1]**2)
+        r_fall       = -10.0 * (height_rel < 0.18).float()   # terrain-relative
+        r_upright = -1.5 * (gravity[:, 0]**2 + gravity[:, 1]**2)
         r_lat_vel    = -3.5  * lin_vel[:, 1]**2
         r_hip_reg    = -1.5  * torch.sum(self._actions[:, :4]**2, dim=1)
         hip_excess   = torch.clamp(torch.abs(self._actions[:, :4]) - 0.06, 0.0)
@@ -686,43 +917,58 @@ class Go1Env(DirectRLEnv):
         # Update contact history (needed for first_touch next step)
         self._prev_feet_contact[:] = feet_contact.detach()
 
-        # ── Foot clearance (velocity gated) and foot drag ─────────────────
+        # ── Foot clearance and drag ────────────────────────────────────────
         r_foot_clear = torch.zeros(self.num_envs, device=self.device)
-        r_foot_drag  = torch.zeros(self.num_envs, device=self.device)
+        r_foot_drag = torch.zeros(self.num_envs, device=self.device)
 
         if self._foot_body_ids is not None:
-            foot_pos      = self._robot.data.body_pos_w[:, self._foot_body_ids, :]
-            foot_vel      = self._robot.data.body_vel_w[:, self._foot_body_ids, :]
-            swing_mask    = 1.0 - feet_contact
-            ground_z      = self.scene.env_origins[:, 2].unsqueeze(1)
-            foot_z        = foot_pos[:, :, 2]
+            foot_pos = self._robot.data.body_pos_w[:, self._foot_body_ids, :]
+            foot_vel = self._robot.data.body_vel_w[:, self._foot_body_ids, :]
+            swing_mask = 1.0 - feet_contact
+            ground_z = self.scene.env_origins[:, 2].unsqueeze(1)
+            foot_z = foot_pos[:, :, 2]
+            foot_z_rel = foot_z - ground_z
 
-            # Clearance: 3cm deadband (blocks passive hang), velocity gated
-            # Vel gate ensures policy must walk to earn clearance reward
-            clearance    = torch.clamp(foot_z - ground_z - 0.03, 0.0, 0.09)
-            r_foot_clear = 2.0 * torch.sum(
-                swing_mask * clearance, dim=1) * vel_gate_gait
+            # ── Clearance: asymmetric weights (from real-hw fix) ──────────
+            # Front legs FL/FR: 3.0 weight — historically dragged on hw
+            # Rear  legs RL/RR: 1.5 weight — already lifting well
+            # Deadband REMOVED for rough terrain:
+            #   On flat: 3cm deadband prevents passive hang (ok)
+            #   On rough: terrain bumps bring ground_z up under foot → deadband
+            #             turns clearance negative → policy pushed foot DOWN
+            clearance_w = torch.tensor(
+                [3.0, 3.0, 1.5, 1.5], device=self.device)
+            # No deadband — let any upward foot position earn reward on terrain
+            clearance = torch.clamp(foot_z_rel, 0.0, 0.12)
+            r_foot_clear = torch.sum(
+                swing_mask * clearance
+                * clearance_w.unsqueeze(0), dim=1) * vel_gate_gait
 
-            # Foot drag (no vel gate — always penalise dragging)
+            # ── Drag: contact-shuffle ONLY — NO swing-drag penalty ────────
+            # Swing-drag (-4.0) was causing foot_drag=-241:
+            #   On rough terrain, gravel/wave bumps are near foot during swing
+            #   → false drag fires constantly → policy learned to keep feet low
+            #   to avoid trigger → made FR_kn mean worse (-0.003→-0.111)
+            #
+            # Literature (Rudin 2022, ETH ANYmal, Walk These Ways):
+            #   No swing-drag penalty for rough terrain — handled by air_time
+            #
+            # Keep only: penalise fast feet when IN CONTACT (shuffle prevention)
             foot_speed_xy = torch.norm(foot_vel[:, :, :2], dim=-1)
-            r_foot_drag   = -1.0 * torch.sum(feet_contact * foot_speed_xy, dim=1)
+            r_foot_drag = -1.5 * torch.sum(
+                feet_contact * foot_speed_xy, dim=1)
+            # Weight increased 1.0→1.5 to compensate for removing swing_drag
 
-        # ── FR_th binding proximity penalty — v15: wz-scaled ─────────────
-        # Standard: -2.0 × fr_prox²  (same as v13 for straight walking)
-        # During turns: penalty scales up to -5.0 × fr_prox² at max wz
-        #
-        # WHY: During rotation the FR leg generates asymmetric force.
-        #   RL_th stiction forces impulsive commands → FR_th absorbs compensation.
-        #   Without extra penalty, FR_th drifts toward 0.820 binding zone.
-        #   With wz-scaled penalty: policy learns to keep FR_th clear during turns.
-        #   Real hardware: FR_th cap (0.820) still hard limits target position.
-        #   This reward ensures the APPROACH to 0.820 is slow/careful during wz.
+        # ── FR_th binding proximity — REAL HW FIX: onset 0.800→0.780 ──
+        # Real hardware: FR_th>0.800 on 68% of steps with cap=0.800
+        # The policy was NEVER penalised for approaching 0.800 — only at it.
+        # With onset at 0.780 the gradient starts 20ms earlier, teaching
+        # the policy to AVOID the binding zone rather than get clipped at it.
+        # Penalty ramp: 0 at 0.780, full at 0.850 (70mrad window)
         fr_th_q  = self._robot.data.joint_pos[:, 5]
-        fr_prox  = torch.clamp((fr_th_q - 0.800) / 0.070, 0.0, 1.0)
-        # wz_scale: 0.0 at wz=0 (straight), 1.0 at wz=±_WZ_MAX (max turn)
+        fr_prox = torch.clamp((fr_th_q - 0.790) / 0.070, 0.0, 1.0)
         wz_scale = torch.clamp(self._episode_wz.abs() / self._WZ_MAX, 0.0, 1.0)
-        # Penalty: -2.0 (straight) to -5.0 (max turn)
-        r_fr_binding = -(2.0 + 3.0 * wz_scale) * fr_prox ** 2
+        r_fr_binding = -(2.0 + 1.5 * wz_scale) * fr_prox ** 2
 
         # ── Episode sum tracking ──────────────────────────────────────────
         for k, v in zip(
@@ -748,13 +994,15 @@ class Go1Env(DirectRLEnv):
         ) + r_fall
 
     # =========================================================================
-    # _get_dones — UNCHANGED
+    # _get_dones — terrain-relative height check
     # =========================================================================
     def _get_dones(self):
         g      = self._robot.data.projected_gravity_b
         height = self._robot.data.root_pos_w[:, 2]
         tilt   = torch.sqrt(g[:, 0]**2 + g[:, 1]**2)
-        terminated = (tilt > 0.8) | (height < 0.25) | (g[:, 2] > 0.3)
+        # Height ABOVE terrain origin — works for both flat (terrain_z=0) and rough
+        height_rel = height - self._terrain_z
+        terminated = (tilt > 0.8) | (height_rel < 0.22) | (g[:, 2] > 0.3)
         truncated  = self.episode_length_buf >= self.max_episode_length - 1
         return terminated, truncated
 
@@ -883,13 +1131,41 @@ class Go1Env(DirectRLEnv):
         )
 
         # ── Delay DR ──────────────────────────────────────────────────────
+        # Bug fix: this block was EMPTY in rough terrain version — code was
+        # accidentally deleted during terrain additions. Restored here.
+        # Phase 1: delay=0 (no lag) for first _DELAY_PHASE1_END steps
+        # Phase 2: delay=U[0,8] steps = U[0,16ms] — matches real hardware lag
         if self._global_step < _DELAY_PHASE1_END:
             self._env_delays[env_ids] = 0
         else:
-            if self._global_step == _DELAY_PHASE1_END and env_ids[0] == 0:
-                print(f"\n  [Delay DR] Phase 2 active at step {self._global_step}")
+            if self._global_step == _DELAY_PHASE1_END and len(env_ids) > 0:
+                print(f"\n  [Delay DR] Phase 2 NOW ACTIVE at step "
+                      f"{self._global_step} — delay U[0,{_DELAY_MAX}] steps")
             self._env_delays[env_ids] = torch.randint(
-                0, _DELAY_MAX + 1, (n,), device=self.device)
+                0, _DELAY_MAX + 1, (n,),
+                device=self.device, dtype=torch.long)
+        # MUST run BEFORE robot placement below so env_origins are correct
+        # when root_state[:, :3] = self.scene.env_origins[env_ids] executes.
+        # Previous bug: curriculum ran AFTER placement → old origins used →
+        # robots teleported to new terrain next reset → visible stacking.
+        #
+        # Logic: survived full episode → move up 1 row (harder terrain)
+        #        fell in <50 steps    → move down 1 row (easier terrain)
+        # Flat training: scene.terrain has no terrain_levels → silent no-op
+        try:
+            terrain = self.scene.terrain
+            if hasattr(terrain, 'terrain_levels') and hasattr(terrain, 'update_terrain_levels'):
+                ep_lens   = self.episode_length_buf[env_ids]
+                succeeded = ep_lens >= (self.max_episode_length - 5)
+                fell_fast = ep_lens < 50
+                move = torch.zeros(n, dtype=torch.long, device=self.device)
+                move[succeeded] =  1
+                move[fell_fast] = -1
+                terrain.update_terrain_levels(env_ids, move)
+                # Refresh terrain height offsets BEFORE robot placement
+                self._terrain_z[env_ids] = self.scene.env_origins[env_ids, 2]
+        except Exception:
+            pass   # flat terrain: no-op
 
         # ── Debug print every 200 steps ───────────────────────────────────
         if self._global_step % 200 == 0 and self._global_step > 0:
