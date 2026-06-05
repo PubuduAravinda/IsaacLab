@@ -54,6 +54,17 @@ gym.register(
     },
 )
 
+gym.register(
+    id="Isaac-Go1-Sparse-Rough-Direct-v0",
+    entry_point="isaaclab_tasks.direct.go1.go1_env_sparse_rough:Go1EnvSparseRough",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point":
+            "isaaclab_tasks.direct.go1.go1_rough_env_cfg:Go1RoughEnvCfg",
+        "rsl_rl_cfg_entry_point":
+            f"{agents.__name__}.rsl_rl_ppo_cfg:Go1SparsePPORunnerCfg",
+    },
+)
 # gym.register(
 #     id="Isaac-Velocity-Rough-Go1-Direct-v0",
 #     entry_point="isaaclab_tasks.direct.go1.go1_env:Go1Env",

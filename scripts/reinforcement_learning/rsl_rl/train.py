@@ -103,38 +103,42 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     # Detect sparse vs flat to select the correct PPO runner cfg.
     is_go1 = "go1" in args_cli.task.lower()
     is_sparse = "sparse" in args_cli.task.lower()
-    is_rough = "rough" in args_cli.task.lower()  # ← ADD
+    is_rough = "rough" in args_cli.task.lower()
+    is_sparse_rough = is_sparse and is_rough  # ← ADD ONE LINE
 
     if is_go1:
-        if is_sparse:
+        if is_sparse_rough:  # ← ADD BLOCK — must be BEFORE is_sparse
+            from isaaclab_tasks.direct.go1.go1_rough_env_cfg import (
+                Go1RoughEnvCfg, make_rough_scene, TERRAIN_TOTAL_PATCHES)
+            env_cfg = Go1RoughEnvCfg()
+            agent_cfg = Go1SparsePPORunnerCfg()
+            print("[INFO] Go1 SPARSE-ROUGH task — Go1RoughEnvCfg + Go1SparsePPORunnerCfg")
+
+        elif is_sparse:  # ← unchanged
             env_cfg = Go1FlatEnvCfg()
             agent_cfg = Go1SparsePPORunnerCfg()
             print("[INFO] Go1 SPARSE task — Go1FlatEnvCfg + Go1SparsePPORunnerCfg")
 
-        elif is_rough:
+        elif is_rough:  # ← unchanged
             from isaaclab_tasks.direct.go1.go1_rough_env_cfg import (
                 Go1RoughEnvCfg, make_rough_scene, TERRAIN_TOTAL_PATCHES)
             env_cfg = Go1RoughEnvCfg()
             agent_cfg = Go1RslRlPpoCfg()
             print("[INFO] Go1 ROUGH task — Go1RoughEnvCfg + Go1RslRlPpoCfg")
 
-        else:
+        else:  # ← unchanged
             env_cfg = Go1FlatEnvCfg()
             agent_cfg = Go1RslRlPpoCfg()
             print("[INFO] Go1 FLAT task — Go1FlatEnvCfg + Go1RslRlPpoCfg")
 
-        # Re-apply CLI overrides
+        # Re-apply CLI overrides — UNCHANGED
         if args_cli.device is not None:
             env_cfg.sim.device = args_cli.device
             agent_cfg.device = args_cli.device
         if args_cli.max_iterations is not None:
             agent_cfg.max_iterations = args_cli.max_iterations
 
-        if is_rough:
-            # ── STACKING FIX ────────────────────────────────────────────────
-            # Rebuild scene with correct num_envs BEFORE gym.make().
-            # @configclass freezes scene(num_envs=1) at class definition time.
-            # make_rough_scene(N) constructs fresh so terrain assigns N origins.
+        if is_rough:  # ← covers BOTH is_rough and is_sparse_rough
             _n = args_cli.num_envs if args_cli.num_envs is not None \
                 else TERRAIN_TOTAL_PATCHES
             env_cfg.scene = make_rough_scene(_n)
@@ -144,13 +148,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
                   f"{_n / TERRAIN_TOTAL_PATCHES:.1f} envs/patch)")
             if _n > TERRAIN_TOTAL_PATCHES:
                 print(f"[INFO] >{TERRAIN_TOTAL_PATCHES} envs → "
-                      f"{_n / TERRAIN_TOTAL_PATCHES:.1f} per patch "
-                      f"(intentional for training)")
+                      f"{_n / TERRAIN_TOTAL_PATCHES:.1f} per patch (intentional)")
             else:
-                print(f"[INFO] ≤{TERRAIN_TOTAL_PATCHES} envs → "
-                      f"1 env/patch (no stacking) ✓")
+                print(f"[INFO] ≤{TERRAIN_TOTAL_PATCHES} envs → 1 env/patch ✓")
         else:
-            # Flat / sparse: standard num_envs override
             if args_cli.num_envs is not None:
                 env_cfg.scene.num_envs = args_cli.num_envs
 
