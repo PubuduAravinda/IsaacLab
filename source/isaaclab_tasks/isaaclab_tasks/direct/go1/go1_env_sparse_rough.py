@@ -68,13 +68,18 @@ METABOLIC_WEIGHT  = -0.005   # 5× larger than original -0.001
                                # At -0.001 the diff was 0.006/step (0.4% of displacement → ignored)
                                # At -0.005 the diff is 0.031/step (2%) → policy adapts frequency
                                # This IS the biological mechanism — metabolic cost selects gait Hz
-STRIDE_LEN_WEIGHT = 3.0      # Alexander 1976: longer strides = fewer collision losses/metre
-                               # stride_len = air_time × vx (metres per stride)
-                               # 35ms tap at 0.5m/s = 0.0175m → 57 impacts/m (costly)
+STRIDE_LEN_WEIGHT = 5.0      # was 3.0 → stronger signal for longer strides on hardware
+                               # 14Hz hw (35ms swing): 0.035×0.5=0.018m → tiny
+                               # 4Hz  hw (125ms swing): 0.125×0.5=0.063m → 3.5× more
+                               # Policy discovers FR forward reach naturally (no explicit target)
+                               # Alexander 1976: longer strides = fewer collision losses/metre
                                # 200ms swing at 0.5m/s = 0.100m → 10 impacts/m (natural)
                                # NOT gameable: needs BOTH long air time AND forward velocity
 UPRIGHT_WEIGHT    = -0.5
-FR_BINDING_WEIGHT = -2.0
+FR_BINDING_WEIGHT = -3.0     # was -2.0 → stronger: onset now at 0.750 where
+                               # hardware FR_th actually operates (0.766 mean)
+                               # Combined with onset 0.750: clear gradient to
+                               # keep FR_th below binding zone in training
 WZ_EXCESS_WEIGHT  = -0.3
 RATE_WEIGHT       = -0.05
 JERK_WEIGHT       = -0.02
@@ -113,12 +118,31 @@ class Go1EnvSparseRough(Go1Env):
         self._prev_pos_xy = self._robot.data.root_pos_w[:, :2].clone()
 
         # ── Stride length tracking (Alexander 1976) ───────────────────
-        # Track body-frame vx accumulated while each foot is airborne.
-        # At touchdown: stride_length = integral of vx during swing
-        # Approximation: last_air × current_vx (matches contact sensor api)
-        # Reset at each liftoff so each stride is measured independently.
         self._stride_vx_sum  = torch.zeros(_n, 4, device=self.device)
         self._foot_was_up    = torch.zeros(_n, 4, device=self.device)
+
+        # ── Commanded trajectory tracking (user's idea) ───────────────
+        # Integrate the commanded (vx, wz) each step to get the EXPECTED
+        # world position. Penalise deviation from this expected path.
+        #
+        # For wz=0.00: expected path = straight line → only x changes
+        # For wz=0.10: expected path = arc radius=vx/wz → robot must
+        #              follow THAT arc, not drift inside or outside it
+        #
+        # Cross-track error = distance(actual_local, expected_local)
+        # Saturated at 0.5m to prevent divergence if FR_th binding
+        # causes unavoidable drift (caps max penalty, keeps training stable)
+        self._expected_pos_local = torch.zeros(_n, 2, device=self.device)
+        self._expected_heading   = torch.zeros(_n, device=self.device)
+        # For wz≈0 episodes: y-drift from start = cumulative path error.
+        # Unlike r_lateral (instantaneous vy²), this catches sustained drift
+        # that back-forth rocking produces (vy cancels but y drifts).
+        # Training: perfect Isaac world [x,y] coordinates.
+        # Deploy: use IMU yaw integral → corrective obs[2] → same response.
+        self._episode_start_xy  = torch.zeros(_n, 2, device=self.device)
+        # heading_integral NOT used — obs[2] stays fixed wz_cmd during training
+        # Path straightness enforced by r_lateral + r_ang_vel (step-by-step)
+        # FR_th PACE DR in go1_env.py handles physical binding compensation
 
         # Gait emergence logging (research output — NOT reward)
         self._gait_log = {
@@ -131,7 +155,7 @@ class Go1EnvSparseRough(Go1Env):
         }
 
         # Override episode sums to match new reward keys
-        _rk = ["displacement", "lateral", "ang_vel",
+        _rk = ["displacement", "lateral", "traj_track", "ang_vel",
                "metabolic", "upright", "alive",
                "fall", "fr_binding", "wz_excess", "action_rate", "action_jerk",
                "stride_quality", "stride_len", "hip_posture", "hip_reg"]
@@ -181,7 +205,29 @@ class Go1EnvSparseRough(Go1Env):
         # Weight -1.0: same order as in go1_env.py r_lat_vel.
         r_lateral = -1.0 * lin_vel[:, 1]**2
 
-        # ── 1c. HEADING CONTROL — natural directional intent ────────────
+        # ── 1c. COMMANDED TRAJECTORY TRACKING ─────────────────────────
+        # User idea: integrate commanded (vx_cmd, wz_cmd) each step to get
+        # expected world position. Penalise deviation from expected path.
+        #
+        #   wz=0.00, vx=0.5: expected = straight +x line
+        #   wz=0.10, vx=0.5: expected = arc radius=5m curving left
+        #   wz=-0.20, vx=0.5: expected = arc radius=2.5m curving right
+        #
+        # Cross-track = ||actual_local - expected_local||
+        # Saturated at 0.5m → max penalty -0.125/step (never diverges)
+        vx_cmd_traj = self.command_manager.command[:, 0]
+        cos_h = torch.cos(self._expected_heading)
+        sin_h = torch.sin(self._expected_heading)
+        self._expected_pos_local[:, 0] += vx_cmd_traj * cos_h * self.step_dt
+        self._expected_pos_local[:, 1] += vx_cmd_traj * sin_h * self.step_dt
+        self._expected_heading          += self._episode_wz * self.step_dt
+
+        pos_world    = self._robot.data.root_pos_w[:, :2]
+        pos_local    = pos_world - self.scene.env_origins[:, :2]
+        cross_track  = torch.norm(pos_local - self._expected_pos_local, dim=1)
+        r_traj_track = -0.5 * torch.clamp(cross_track, max=0.5)**2
+
+        # ── 1d. HEADING CONTROL — natural directional intent ────────────
         # Biological basis:
         #   Straight walking: an animal moving to a destination doesn't
         #   spin randomly — maintaining heading costs nothing extra and
@@ -207,8 +253,8 @@ class Go1EnvSparseRough(Go1Env):
         is_straight = (self._episode_wz.abs() < 0.10)
         r_ang_vel = torch.where(
             is_straight,
-            -0.5  * ang_vel[:, 2]**2,                                   # straight: damp drift
-            0.3   * torch.exp(-(ang_vel[:, 2] - self._episode_wz)**2    # turning: track wz
+            -0.5  * ang_vel[:, 2]**2,                                   # straight: gentle damping (was -2.0 → killed turning)
+            0.8   * torch.exp(-(ang_vel[:, 2] - self._episode_wz)**2    # turning: stronger tracking (was 0.3 → too weak)
                                / 0.25)
         )
 
@@ -248,7 +294,13 @@ class Go1EnvSparseRough(Go1Env):
         # ── 6. FR_th BINDING — hardware safety ─────────────────────────
         # Identical to go1_env.py — protects FR_th from mechanical binding.
         fr_th_q  = self._robot.data.joint_pos[:, 5]
-        fr_prox  = torch.clamp((fr_th_q - 0.790) / 0.060, 0.0, 1.0)
+        # Onset tightened 0.790→0.750: hardware FR_th mean=0.766 was BELOW
+        # old onset → zero penalty where FR_th actually operates!
+        # New onset 0.750: penalty fires at 0.766 (fr_prox=0.267)
+        # Policy learns to keep FR_th below 0.750 → 3-leg compensation gait
+        # On hardware: FR_th still goes to 0.842 but policy adapted gait
+        # to not RELY on FR_th contribution beyond 0.750 range
+        fr_prox  = torch.clamp((fr_th_q - 0.750) / 0.060, 0.0, 1.0)
         wz_scale = torch.clamp(self._episode_wz.abs() / self._WZ_MAX, 0.0, 1.0)
         r_fr_binding = -(abs(FR_BINDING_WEIGHT) + 1.5 * wz_scale) * fr_prox**2
 
@@ -363,11 +415,11 @@ class Go1EnvSparseRough(Go1Env):
 
         # ── Episode sums ───────────────────────────────────────────────
         for k, v in zip(
-            ["displacement", "lateral", "ang_vel",
+            ["displacement", "lateral", "traj_track", "ang_vel",
              "metabolic", "upright", "alive",
              "fall", "fr_binding", "wz_excess", "action_rate", "action_jerk",
              "stride_quality", "stride_len", "hip_posture", "hip_reg"],
-            [r_displacement, r_lateral, r_ang_vel,
+            [r_displacement, r_lateral, r_traj_track, r_ang_vel,
              r_metabolic, r_upright, r_alive,
              r_fall, r_fr_binding, r_wz_excess, r_action_rate, r_action_jerk,
              r_stride_quality, r_stride_len, r_hip_posture, r_hip_reg]
@@ -376,7 +428,7 @@ class Go1EnvSparseRough(Go1Env):
 
         # ── Total reward ───────────────────────────────────────────────
         return self.step_dt * (
-            r_displacement + r_lateral   + r_ang_vel
+            r_displacement + r_lateral   + r_traj_track + r_ang_vel
             + r_metabolic  + r_upright   + r_alive
             + r_fr_binding + r_wz_excess
             + r_action_rate + r_action_jerk
@@ -439,3 +491,10 @@ class Go1EnvSparseRough(Go1Env):
             self._robot.data.root_pos_w[env_ids, :2].clone())
         self._stride_vx_sum[env_ids]  = 0.0
         self._foot_was_up[env_ids]    = 0.0
+
+        # Reset commanded trajectory — robot spawns at env origin, heading=+x
+        # Expected position starts at actual spawn local position
+        spawn_pos = self._robot.data.root_pos_w[env_ids, :2]
+        self._expected_pos_local[env_ids] = (
+            spawn_pos - self.scene.env_origins[env_ids, :2])
+        self._expected_heading[env_ids]   = 0.0   # spawn faces +x direction

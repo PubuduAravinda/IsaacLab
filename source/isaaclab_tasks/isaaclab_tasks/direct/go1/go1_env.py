@@ -1066,6 +1066,13 @@ class Go1Env(DirectRLEnv):
             self._kp_dr_hip_th_lo, self._kp_dr_hip_th_hi)
         kp_scale[:, 8:] = torch.empty(n, 4, device=self.device).uniform_(
             self._kp_dr_kn_lo, self._kp_dr_kn_hi)
+
+        kp_scale[:, 6] = torch.empty(n, device=self.device).uniform_(0.60, 0.95)
+        # RL_th trained at 65×[0.60,0.95]=[39,61.75] Nm/rad instead of [48.75,81.25]
+        # Real RL_th is less responsive than sim due to stiction compliance gap
+        # Lower KP range → policy generates stronger commands for same joint output
+        # Policy learns to drive RL_th more firmly → rear leg pushes forward properly
+
         new_kp = self._kp_nominal.unsqueeze(0) * kp_scale
         actuator.stiffness[env_ids] = new_kp
         self._kp_live[env_ids]      = new_kp
@@ -1109,10 +1116,15 @@ class Go1Env(DirectRLEnv):
         rl_tau_f_values  = tau_f_healthy_rl + rl_fault_level * (
             tau_f_fault_rl - tau_f_healthy_rl)
 
+        # if self._friction_env_ids_ok and self._tau_fn is not None:
+        #     tau_f_reset = self._tau_f_nominal.unsqueeze(0).expand(n, -1).clone()
+        #     tau_f_reset[:, 6] = rl_tau_f_values
+        #     getattr(self._robot, self._tau_fn)(tau_f_reset, env_ids=env_ids)
         if self._friction_env_ids_ok and self._tau_fn is not None:
             tau_f_reset = self._tau_f_nominal.unsqueeze(0).expand(n, -1).clone()
-            tau_f_reset[:, 6] = rl_tau_f_values
+            tau_f_reset[:, 6] = rl_tau_f_values  # RL_th stiction only
             getattr(self._robot, self._tau_fn)(tau_f_reset, env_ids=env_ids)
+
         # If env_ids not supported: τf stays at init value (4.944 for RL_th).
         # d-only DR still provides meaningful spectrum of viscous resistance.
 
@@ -1187,7 +1199,8 @@ class Go1Env(DirectRLEnv):
             fr_th_cap = (self._robot.data.default_joint_pos[env_ids[0], 5].item()
                          + self._fr_th_max_delta)
             print(f"  [FR_th]    cap={fr_th_cap:.3f}  "
-                  f"proximity penalty starts at 0.800")
+                  f"proximity penalty starts at 0.800  "
+                  f"τf_DR=[0, 3.0]Nm ✓")
 
         # ── Reset state ───────────────────────────────────────────────────
         _mid  = (self._delta_soft_hi + self._delta_soft_lo) * 0.5
