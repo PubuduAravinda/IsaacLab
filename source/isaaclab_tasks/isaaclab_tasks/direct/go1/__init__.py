@@ -42,6 +42,32 @@ gym.register(
     },
 )
 
+# ── Baseline: nominal policy, no calibration (ablation row 1) ────────────
+gym.register(
+    id="Isaac-Velocity-Flat-Go1-Baseline-v0",
+    entry_point="isaaclab_tasks.direct.go1.go1_env_baseline:Go1BaselineEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point":
+            "isaaclab_tasks.direct.go1.go1_env_cfg:Go1FlatEnvCfg",
+        "rsl_rl_cfg_entry_point":
+            f"{agents.__name__}.rsl_rl_ppo_cfg:Go1RslRlPpoCfg",
+    },
+)
+
+# ── Uniform masking: Kim-style, p=0.05 all joints (ablation row 2) ───────
+gym.register(
+    id="Isaac-Velocity-Flat-Go1-UniformMask-v0",
+    entry_point="isaaclab_tasks.direct.go1.go1_env_uniform_mask:Go1UniformMaskEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point":
+            "isaaclab_tasks.direct.go1.go1_env_cfg:Go1FlatEnvCfg",
+        "rsl_rl_cfg_entry_point":
+            f"{agents.__name__}.rsl_rl_ppo_cfg:Go1RslRlPpoCfg",
+    },
+)
+
 gym.register(
     id="Isaac-Velocity-Rough-Go1-Direct-v0",
     entry_point="isaaclab_tasks.direct.go1.go1_env:Go1Env",

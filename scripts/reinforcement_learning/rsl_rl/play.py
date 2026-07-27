@@ -63,6 +63,21 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 from isaaclab_tasks.direct.go1.go1_env_cfg import Go1FlatEnvCfg
 from isaaclab_tasks.direct.go1.agents.rsl_rl_ppo_cfg import Go1RslRlPpoCfg
+try:
+    from isaaclab_tasks.direct.go1.agents.rsl_rl_ppo_cfg import Go1SparsePPORunnerCfg
+    _GO1_SPARSE_CFG_OK = True
+except ImportError:
+    Go1SparsePPORunnerCfg = None
+    _GO1_SPARSE_CFG_OK = False
+
+from isaaclab_tasks.direct.go2.go2_env_cfg import Go2FlatEnvCfg
+from isaaclab_tasks.direct.go2.agents.rsl_rl_ppo_cfg import Go2RslRlPpoCfg
+try:
+    from isaaclab_tasks.direct.go2.agents.rsl_rl_ppo_cfg import Go2SparsePPORunnerCfg
+    _GO2_SPARSE_CFG_OK = True
+except ImportError:
+    Go2SparsePPORunnerCfg = None
+    _GO2_SPARSE_CFG_OK = False
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -71,12 +86,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
-    # ── Always rebuild Go1 cfg for play ──────────────────────────────────────
+    # ── Rebuild cfg from scratch for play — same reasoning as train.py:
+    #    @configclass bakes scene(num_envs) at class definition time.
     is_go1 = "go1" in args_cli.task.lower()
+    is_go2 = "go2" in args_cli.task.lower()
+    is_sparse = "sparse" in args_cli.task.lower()
     is_rough = "rough" in args_cli.task.lower()
+    is_sparse_rough = is_sparse and is_rough
 
     if is_go1:
-        if is_rough:
+        if is_sparse_rough:
+            from isaaclab_tasks.direct.go1.go1_rough_env_cfg import (
+                Go1RoughEnvCfg, make_rough_scene, TERRAIN_TOTAL_PATCHES)
+            env_cfg = Go1RoughEnvCfg()
+            agent_cfg = Go1SparsePPORunnerCfg() if _GO1_SPARSE_CFG_OK else Go1RslRlPpoCfg()
+            print("[PLAY] Go1 SPARSE-ROUGH task")
+        elif is_sparse:
+            env_cfg = Go1FlatEnvCfg()
+            agent_cfg = Go1SparsePPORunnerCfg() if _GO1_SPARSE_CFG_OK else Go1RslRlPpoCfg()
+            print("[PLAY] Go1 SPARSE task")
+        elif is_rough:
             from isaaclab_tasks.direct.go1.go1_rough_env_cfg import (
                 Go1RoughEnvCfg, make_rough_scene, TERRAIN_TOTAL_PATCHES)
             env_cfg = Go1RoughEnvCfg()
@@ -87,22 +116,44 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
             agent_cfg = Go1RslRlPpoCfg()
             print("[PLAY] Go1 FLAT task")
 
-        if args_cli.device is not None:
-            env_cfg.sim.device = args_cli.device
-            agent_cfg.device = args_cli.device
+    elif is_go2:
+        if is_sparse_rough:
+            from isaaclab_tasks.direct.go2.go2_rough_env_cfg import (
+                Go2RoughEnvCfg, make_go2_rough_scene, TERRAIN_TOTAL_PATCHES)
+            env_cfg = Go2RoughEnvCfg()
+            agent_cfg = Go2SparsePPORunnerCfg() if _GO2_SPARSE_CFG_OK else Go2RslRlPpoCfg()
+            print("[PLAY] Go2 SPARSE-ROUGH task")
+        elif is_rough:
+            from isaaclab_tasks.direct.go2.go2_rough_env_cfg import (
+                Go2RoughEnvCfg, make_go2_rough_scene, TERRAIN_TOTAL_PATCHES)
+            env_cfg = Go2RoughEnvCfg()
+            agent_cfg = Go2RslRlPpoCfg()
+            print("[PLAY] Go2 ROUGH task")
+        else:
+            env_cfg = Go2FlatEnvCfg()
+            agent_cfg = Go2RslRlPpoCfg()
+            print("[PLAY] Go2 FLAT task")
 
-    # For play: 1 env is enough. Change num_envs class field in go1_env_cfg.py
+    if args_cli.device is not None:
+        env_cfg.sim.device = args_cli.device
+        agent_cfg.device = args_cli.device
+
+    # For play: 1 env is enough. Change num_envs class field in *_env_cfg.py
     # before running play if you want more. CLI --num_envs also works here
     # because we're just overriding scene.num_envs after fresh construction.
     if is_rough:
         # Rebuild scene to avoid @configclass num_envs freeze → stacking
+        # make_rough_scene / make_go2_rough_scene were imported above under
+        # the matching is_go1/is_go2 branch, whichever fired.
         _n = args_cli.num_envs if args_cli.num_envs is not None else TERRAIN_TOTAL_PATCHES
-        env_cfg.scene = make_rough_scene(_n)
+        if is_go1:
+            env_cfg.scene = make_rough_scene(_n)
+        else:
+            env_cfg.scene = make_go2_rough_scene(_n)
         env_cfg.scene.num_envs = _n
         print(f"[PLAY] Rough scene: {_n} envs  ({TERRAIN_TOTAL_PATCHES} patches)")
     else:
         if args_cli.num_envs is not None:
-            env_cfg.num_envs = args_cli.num_envs
             env_cfg.scene.num_envs = args_cli.num_envs
             env_cfg.scene.env_spacing = 4.0
             print(f"[PLAY] num_envs overridden to {args_cli.num_envs}")
@@ -165,7 +216,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
     # ── Optional sim logger ───────────────────────────────────────────────────
     # Enabled by --log flag. Captures same channels as real_log_*.npz from
     # go1_deploy_final.py so you can run compare_sim_real.py directly.
-    go1_env = env.unwrapped.unwrapped  # Go1Env instance (unwrap twice)
+    robot_env = env.unwrapped.unwrapped  # Go1Env or Go2Env instance
+    go1_env = robot_env  # keep alias for backward compat
+
     if args_cli.log:
         N = args_cli.log_steps
         # Tell go1_env how many steps to buffer and activate it
@@ -221,12 +274,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
     go1_env._obs_noise_enabled = True   # match training exactly
 
     if args_cli.phase2:
-        from isaaclab_tasks.direct.go1.go1_env import _DELAY_PHASE1_END
+        if is_go2:
+            from isaaclab_tasks.direct.go2.go2_env import (
+                _DELAY_PHASE1_END, _DELAY_MAX)
+        else:
+            from isaaclab_tasks.direct.go1.go1_env import _DELAY_PHASE1_END
+            _DELAY_MAX = 8
         go1_env._global_step = _DELAY_PHASE1_END
-        # Force immediate delay sampling — don't wait for first episode end
-        all_envs = torch.arange(go1_env.num_envs, device=go1_env.device)
-        go1_env._env_delays = torch.randint(
-            0, 8 + 1, (go1_env.num_envs,),
+        go1_env._env_delays  = torch.randint(
+            0, _DELAY_MAX + 1, (go1_env.num_envs,),
             device=go1_env.device, dtype=torch.long)
         print(f"[PLAY] Delays pre-sampled: mean={go1_env._env_delays.float().mean():.1f} "
               f"env0={go1_env._env_delays[0].item()} steps")
@@ -236,7 +292,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
         print("         wrong conditions. Use --phase2 for correct evaluation.")
 
     # ── Action range verification (printed before inference starts) ───────────
-    print("[PLAY] Action range verification (must match go1_deploy.py):")
+    print("[PLAY] Action range verification:")
     lo = go1_env._delta_soft_lo.cpu().numpy()
     hi = go1_env._delta_soft_hi.cpu().numpy()
     JNAMES = ["FL_hip","FR_hip","RL_hip","RR_hip",
@@ -248,9 +304,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
         half = (hi[i]-lo[i])/2
         print(f"  {n:<10} {lo[i]:>7.3f} {hi[i]:>7.3f} {mid:>7.3f} {half:>7.3f}")
     print()
-    print("  [Deploy mapping] go1_deploy.py THIGH_SCALE=0.95, KNEE_SCALE=0.95, HIP_SCALE=0.70")
-    print("  Max thigh hw delta = 0.35 × 0.95 = 0.332 rad (within Go1 URDF limits ✓)")
-    print("  Max knee  hw delta = 0.35 × 0.95 = 0.332 rad (within Go1 URDF limits ✓)")
+    if is_go2:
+        print("  [Deploy mapping] go2_rl_flat_1.py applies the tanh-squashed")
+        print("  delta directly (no separate per-joint SCALE constants) — the")
+        print("  delta_lo/hi above ARE the hardware-applied bounds, hip flip")
+        print("  handled separately for FR_hip/RR_hip (see deploy script).")
+    else:
+        print("  [Deploy mapping] go1_deploy.py THIGH_SCALE=0.95, KNEE_SCALE=0.95, HIP_SCALE=0.70")
+        print("  Max thigh hw delta = 0.35 × 0.95 = 0.332 rad (within Go1 URDF limits ✓)")
+        print("  Max knee  hw delta = 0.35 × 0.95 = 0.332 rad (within Go1 URDF limits ✓)")
     print()
 
     policy   = runner.get_inference_policy(device=env.unwrapped.device)

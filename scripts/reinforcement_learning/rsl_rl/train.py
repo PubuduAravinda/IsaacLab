@@ -66,6 +66,14 @@ from isaaclab_tasks.direct.go1.agents.rsl_rl_ppo_cfg import (
     Go1RslRlPpoCfg,
     Go1SparsePPORunnerCfg,
 )
+from isaaclab_tasks.direct.go2.go2_env_cfg import Go2FlatEnvCfg
+from isaaclab_tasks.direct.go2.agents.rsl_rl_ppo_cfg import Go2RslRlPpoCfg
+try:
+    from isaaclab_tasks.direct.go2.agents.rsl_rl_ppo_cfg import Go2SparsePPORunnerCfg
+    _GO2_SPARSE_CFG_OK = True
+except ImportError:
+    Go2SparsePPORunnerCfg = None
+    _GO2_SPARSE_CFG_OK = False
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -91,20 +99,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
         agent_cfg.device   = f"cuda:{app_launcher.local_rank}"
         env_cfg.seed = agent_cfg.seed = agent_cfg.seed + app_launcher.local_rank
 
-    log_root_path = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
-    print(f"[INFO] Logging to: {log_root_path}")
-    log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    if agent_cfg.run_name:
-        log_dir += f"_{agent_cfg.run_name}"
-    log_dir = os.path.join(log_root_path, log_dir)
+    # NOTE: log_root_path/log_dir computation MOVED to after the task
+    # dispatch block below. It used to be computed here, using whatever
+    # agent_cfg.experiment_name hydra_task_config initially resolved —
+    # but the dispatch block reassigns agent_cfg to a task-specific PPO
+    # cfg AFTER this point, so computing the log path here used the WRONG
+    # (pre-dispatch) experiment_name. Confirmed by a real run: training
+    # Isaac-Velocity-Rough-Go2-v0 saved checkpoints into go2_flat/... —
+    # this ordering bug is why, regardless of what experiment_name the
+    # dispatch block later sets.
 
     # ── Go1 task: rebuild cfg from scratch ───────────────────────────────────
     # @configclass bakes scene(num_envs) at class definition time.
     # Detect sparse vs flat to select the correct PPO runner cfg.
     is_go1 = "go1" in args_cli.task.lower()
+    is_go2 = "go2" in args_cli.task.lower()
     is_sparse = "sparse" in args_cli.task.lower()
     is_rough = "rough" in args_cli.task.lower()
-    is_sparse_rough = is_sparse and is_rough  # ← ADD ONE LINE
+    is_sparse_rough = is_sparse and is_rough
 
     if is_go1:
         if is_sparse_rough:  # ← ADD BLOCK — must be BEFORE is_sparse
@@ -158,6 +170,77 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
         print(f"[INFO] num_envs={env_cfg.scene.num_envs}  "
               f"max_iters={agent_cfg.max_iterations}  "
               f"device={agent_cfg.device}")
+
+    # ── Go2 task: rebuild cfg from scratch — mirrors is_go1 structure ────────
+    elif is_go2:
+        if is_sparse_rough:
+            from isaaclab_tasks.direct.go2.go2_rough_env_cfg import (
+                Go2RoughEnvCfg, make_go2_rough_scene, TERRAIN_TOTAL_PATCHES)
+            env_cfg = Go2RoughEnvCfg()
+            if _GO2_SPARSE_CFG_OK:
+                agent_cfg = Go2SparsePPORunnerCfg()
+                print("[INFO] Go2 SPARSE-ROUGH task — Go2RoughEnvCfg + Go2SparsePPORunnerCfg")
+            else:
+                agent_cfg = Go2RslRlPpoCfg()
+                print("[INFO] Go2 SPARSE-ROUGH task — Go2RoughEnvCfg + Go2RslRlPpoCfg")
+                print("[WARN] Go2SparsePPORunnerCfg not found in agents/rsl_rl_ppo_cfg.py — "
+                      "falling back to Go2RslRlPpoCfg. Add a Go2SparsePPORunnerCfg "
+                      "mirroring Go1SparsePPORunnerCfg for correct sparse-reward-scale "
+                      "PPO hyperparameters.")
+            # Explicit override — do not rely on the PPO cfg class's own
+            # experiment_name. Evidence from a real run: Go2RslRlPpoCfg's
+            # experiment_name is hardcoded "go2_flat" and gets reused as-is
+            # for rough tasks too (checkpoints landed in go2_flat/... when
+            # training Isaac-Velocity-Rough-Go2-v0), silently mixing runs
+            # from different tasks into the same log folder. Setting it
+            # here is robust regardless of what's hardcoded in the class.
+            agent_cfg.experiment_name = "go2_rough_sparse"
+
+        elif is_rough:
+            from isaaclab_tasks.direct.go2.go2_rough_env_cfg import (
+                Go2RoughEnvCfg, make_go2_rough_scene, TERRAIN_TOTAL_PATCHES)
+            env_cfg = Go2RoughEnvCfg()
+            agent_cfg = Go2RslRlPpoCfg()
+            print("[INFO] Go2 ROUGH task — Go2RoughEnvCfg + Go2RslRlPpoCfg")
+            agent_cfg.experiment_name = "go2_rough"   # see note above
+
+        else:
+            env_cfg = Go2FlatEnvCfg()
+            agent_cfg = Go2RslRlPpoCfg()
+            print("[INFO] Go2 FLAT task — Go2FlatEnvCfg + Go2RslRlPpoCfg")
+            # Leave agent_cfg.experiment_name as whatever the class already
+            # sets ("go2_flat" per the evidence above) — flat is presumably
+            # what it was originally written for, unchanged here.
+
+        if args_cli.device is not None:
+            env_cfg.sim.device = args_cli.device
+            agent_cfg.device   = args_cli.device
+        if args_cli.max_iterations is not None:
+            agent_cfg.max_iterations = args_cli.max_iterations
+
+        if is_rough:  # covers BOTH is_rough and is_sparse_rough, same as Go1
+            _n = args_cli.num_envs if args_cli.num_envs is not None \
+                else TERRAIN_TOTAL_PATCHES
+            env_cfg.scene = make_go2_rough_scene(_n)
+            env_cfg.scene.num_envs = _n
+            print(f"[INFO] Go2 rough scene rebuilt for {_n} envs  "
+                  f"({TERRAIN_TOTAL_PATCHES} patches, "
+                  f"{_n / TERRAIN_TOTAL_PATCHES:.1f} envs/patch)")
+        else:
+            if args_cli.num_envs is not None:
+                env_cfg.scene.num_envs = args_cli.num_envs
+
+        print(f"[INFO] num_envs={env_cfg.scene.num_envs}  "
+              f"max_iters={agent_cfg.max_iterations}  "
+              f"device={agent_cfg.device}")
+
+    # ── log path computed HERE, after agent_cfg.experiment_name is final ────
+    log_root_path = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
+    print(f"[INFO] Logging to: {log_root_path}")
+    log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    if agent_cfg.run_name:
+        log_dir += f"_{agent_cfg.run_name}"
+    log_dir = os.path.join(log_root_path, log_dir)
 
     env_cfg.log_dir = log_dir
 

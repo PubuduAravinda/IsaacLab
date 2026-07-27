@@ -1,3 +1,7 @@
+'''
+python train.py --task Isaac-Go1-Sparse-Rough-Direct-v0 --num_envs 4096 --headless --checkpoint /home/sripu715/IsaacLab/scripts/reinforcement_learning/rsl_rl/logs/rsl_rl/go1_himloco/2026-06-01_20-06-31/model_13700.pt
+'''
+
 # go1_env_sparse_rough.py — Natural Gait on Rough Terrain
 # v2: Inherits ALL infrastructure from go1_env.py — only _get_rewards changed
 #
